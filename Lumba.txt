@@ -1,0 +1,115 @@
+Migration of Log Generation Automation from Azure Automation Account to Azure Functions
+
+Overview
+
+This document outlines the migration of the existing log generation automation from Azure Automation Account to Azure Functions within the Azure ecosystem.
+The goal of this migration was to eliminate infrastructure dependency, improve reliability, and introduce a self-healing mechanism for consistent daily log generation across multiple tenants.
+
+⸻
+
+Background
+
+Previously, the log generation process was implemented using Azure Automation Account runbooks.
+The script was responsible for generating both Azure Activity Logs and Azure AD (Entra) Logs for the following five tenants:
+	•	Strategic
+	•	Mortgage
+	•	Payme
+	•	Sitecore
+	•	Kula Keep
+
+Each runbook executed daily and stored the generated log files in a central Azure Storage Account.
+
+However, the legacy setup faced multiple operational challenges.
+
+⸻
+
+Challenges with the Old Setup (Automation Account)
+	1.	Dependency on Hybrid Workers (VMs):
+The runbooks were configured to run on hybrid worker virtual machines. Any downtime, patching, or performance degradation on these VMs would cause job failures.
+	2.	Infrastructure Instability:
+Failures due to VM unavailability, network issues, or throttling were frequent, leading to inconsistent execution.
+	3.	Manual Recovery Efforts:
+In case of failure, engineers had to manually rerun the automation. This consumed significant SRE and operations effort.
+	4.	Frequent Incidents Raised by IEM Team:
+Failures were often reported through incidents, impacting overall reliability metrics and service health.
+
+⸻
+
+Migration to Azure Functions
+
+To overcome the above challenges, the automation was migrated to Azure Functions.
+This serverless approach removed dependency on hybrid workers and virtual machines, leveraging Azure’s scalable and managed runtime environment.
+
+Each function:
+	•	Generates Azure and Azure AD logs for its respective tenant.
+	•	Stores the generated log files in the designated storage container.
+	•	Runs on a daily schedule using CRON triggers.
+
+⸻
+
+Post-Migration Challenges
+
+While the migration eliminated infrastructure dependencies, a few new issues emerged due to the nature of the serverless environment:
+	1.	Cold Start Failures:
+Occasionally, the function failed to start on schedule because of cold start delays in the Function App.
+	2.	Module Download Issues:
+During cold starts, PowerShell modules sometimes failed to download correctly, causing the function to terminate before execution.
+	3.	Missed Runs:
+Since the function was scheduled only once per day, a failed execution meant data was skipped entirely for that day.
+
+⸻
+
+Implementation of Self-Healing Mechanism
+
+To address these challenges, a new “Monitoring and Self-Healing Script” was developed and deployed as a separate Azure Function.
+
+Key Responsibilities
+	1.	Storage Verification:
+The script runs multiple times daily (five times a day) to validate the presence of all expected log files in the storage account.
+	2.	File Validation:
+It checks for files generated for all five tenants and ensures each file is present with the correct timestamp/date.
+	3.	Automated Recovery:
+If any file for a tenant is missing or incomplete, the script automatically re-triggers the corresponding log generation function for that tenant.
+	4.	Notification System:
+It sends an automated email alert to the engineering team, informing them of the missing file(s) and the triggered recovery action.
+
+⸻
+
+Benefits and Impact
+	1.	Zero Manual Intervention:
+The system now auto-heals — failed or missed executions are automatically re-run without human involvement.
+	2.	Improved Reliability:
+Each tenant’s logs are guaranteed to be generated daily, ensuring 100% data consistency.
+	3.	No Infrastructure Dependency:
+The move to serverless Azure Functions removed reliance on VMs and hybrid workers.
+	4.	Operational Efficiency:
+The engineering and SRE teams no longer need to monitor or manually trigger re-runs, reducing daily operational load.
+	5.	Incident Reduction:
+The setup achieved zero incidents related to missing or failed log generations, significantly improving reliability KPIs.
+
+⸻
+
+Architecture Overview
+
+Components Involved:
+	•	Azure Functions (Primary): Generates Azure and Azure AD logs for each tenant.
+	•	Azure Storage Account: Stores the generated log files.
+	•	Azure Functions (Monitoring): Periodically verifies file presence and triggers re-runs if required.
+	•	Email Notification Logic: Sends alerts on missing or inconsistent files.
+
+Execution Frequency:
+	•	Log generation: Once daily per tenant
+	•	Monitoring/self-healing: Five times per day
+
+Triggering Mechanisms:
+	•	CRON-based schedule for both primary and monitoring functions.
+
+⸻
+
+Outcome
+
+This migration and enhancement significantly improved the system’s stability, maintainability, and resilience.
+By introducing self-healing capabilities and moving to serverless architecture, the team achieved:
+	•	100% successful log generation rate
+	•	Zero incidents raised
+	•	Reduced operational overhead
