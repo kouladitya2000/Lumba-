@@ -1,115 +1,110 @@
-Migration of Log Generation Automation from Azure Automation Account to Azure Functions
+# =========================
+# KeyVault Enumeration Script
+# =========================
 
-Overview
+$mResults = @()
+$mNoItem = ""
+if ($ReportOn -eq "KeyVaultKey") {
+    $mNoItem = "No Key"
+}
+else {
+    $mNoItem = "No Certificate"
+}
 
-This document outlines the migration of the existing log generation automation from Azure Automation Account to Azure Functions within the Azure ecosystem.
-The goal of this migration was to eliminate infrastructure dependency, improve reliability, and introduce a self-healing mechanism for consistent daily log generation across multiple tenants.
+$mNoAccess = "NO ACCESS"
 
-⸻
+$subscriptions = Get-AzSubscription
+foreach ($sub in $subscriptions) {
 
-Background
+    Set-AzContext -SubscriptionId $sub.Id | Out-Null
 
-Previously, the log generation process was implemented using Azure Automation Account runbooks.
-The script was responsible for generating both Azure Activity Logs and Azure AD (Entra) Logs for the following five tenants:
-	•	Strategic
-	•	Mortgage
-	•	Payme
-	•	Sitecore
-	•	Kula Keep
+    $mSubName     = (Get-AzContext).Subscription.Name
+    $mSubId       = (Get-AzContext).Subscription.Id
+    $mSubTenantId = (Get-AzContext).Subscription.TenantId
 
-Each runbook executed daily and stored the generated log files in a central Azure Storage Account.
+    Write-Host "Reading KVs from $mSubName ($mSubId)"
 
-However, the legacy setup faced multiple operational challenges.
+    $vaults = Search-AzGraph -Query "resources | where type =~ 'microsoft.keyvault/vaults'" -Subscription $mSubId -ErrorAction SilentlyContinue
 
-⸻
+    if (-not $vaults) {
+        Write-Host "No KeyVaults found in $mSubName"
+        continue
+    }
 
-Challenges with the Old Setup (Automation Account)
-	1.	Dependency on Hybrid Workers (VMs):
-The runbooks were configured to run on hybrid worker virtual machines. Any downtime, patching, or performance degradation on these VMs would cause job failures.
-	2.	Infrastructure Instability:
-Failures due to VM unavailability, network issues, or throttling were frequent, leading to inconsistent execution.
-	3.	Manual Recovery Efforts:
-In case of failure, engineers had to manually rerun the automation. This consumed significant SRE and operations effort.
-	4.	Frequent Incidents Raised by IEM Team:
-Failures were often reported through incidents, impacting overall reliability metrics and service health.
+    foreach ($vault in $vaults) {
 
-⸻
+        $strSPNKeyVaultName = $vault.name
+        $mResourceGroupName = $vault.resourceGroup
 
-Migration to Azure Functions
+        Write-Host "Reading $strSPNKeyVaultName"
 
-To overcome the above challenges, the automation was migrated to Azure Functions.
-This serverless approach removed dependency on hybrid workers and virtual machines, leveraging Azure’s scalable and managed runtime environment.
+        try {
+            $objKeyVault = Get-AzKeyVault -VaultName $strSPNKeyVaultName -ErrorAction Stop
 
-Each function:
-	•	Generates Azure and Azure AD logs for its respective tenant.
-	•	Stores the generated log files in the designated storage container.
-	•	Runs on a daily schedule using CRON triggers.
+            if ($ReportOn -eq "KeyVaultKey") {
+                $mKvItems = Get-AzKeyVaultKey -VaultName $strSPNKeyVaultName -ErrorAction SilentlyContinue
+            }
+            else {
+                $mKvItems = Get-AzKeyVaultCertificate -VaultName $strSPNKeyVaultName -ErrorAction SilentlyContinue
+            }
 
-⸻
+            if ($mKvItems) {
+                foreach ($item in $mKvItems) {
+                    $mResults += [PSCustomObject]@{
+                        "Subscription_Name" = $mSubName
+                        "Subscription_Id"   = $mSubId
+                        "Tenant_Id"         = $mSubTenantId
+                        "VaultName"         = $strSPNKeyVaultName
+                        "ResourceGroupName" = $mResourceGroupName
+                        "KeyName"           = $item.Name
+                        "Created"           = $item.Attributes.Created
+                        "Expires"           = $item.Attributes.Expires
+                        "Enabled"           = $item.Attributes.Enabled
+                        "Version"           = if ($ReportOn -eq "KeyVaultKey") { ($item.Kid.Split('/')[-1]) } else { $item.Version }
+                        "Updated"           = $item.Attributes.Updated
+                        "Id"                = if ($ReportOn -eq "KeyVaultKey") { $item.Kid } else { $item.Id }
+                        "Permissions"       = ($objKeyVault.AccessPolicies | Select-Object DisplayName, ObjectId, PermissionsToKeys)
+                    }
+                }
+            }
+            else {
+                $mResults += [PSCustomObject]@{
+                    "Subscription_Name" = $mSubName
+                    "Subscription_Id"   = $mSubId
+                    "Tenant_Id"         = $mSubTenantId
+                    "VaultName"         = $strSPNKeyVaultName
+                    "ResourceGroupName" = $mResourceGroupName
+                    "KeyName"           = $mNoItem
+                    "Created"           = $mNoItem
+                    "Expires"           = $mNoItem
+                    "Enabled"           = $mNoItem
+                    "Version"           = $mNoItem
+                    "Updated"           = $mNoItem
+                    "Id"                = $mNoItem
+                    "Permissions"       = ($objKeyVault.AccessPolicies | Select-Object DisplayName, ObjectId, PermissionsToKeys)
+                }
+            }
+        }
+        catch {
+            Write-Host "Error: Unable to connect to KeyVault $strSPNKeyVaultName in subscription $mSubName - $($_.Exception.Message)"
+            Write-Host "Automation SPN does not have access to KeyVault $strSPNKeyVaultName to list keys"
+            $mResults += [PSCustomObject]@{
+                "Subscription_Name" = $mSubName
+                "Subscription_Id"   = $mSubId
+                "Tenant_Id"         = $mSubTenantId
+                "VaultName"         = $strSPNKeyVaultName
+                "ResourceGroupName" = $mResourceGroupName
+                "KeyName"           = $mNoAccess
+                "Created"           = $mNoAccess
+                "Expires"           = $mNoAccess
+                "Enabled"           = $mNoAccess
+                "Version"           = $mNoAccess
+                "Updated"           = $mNoAccess
+                "Id"                = $mNoAccess
+                "Permissions"       = $null
+            }
+        }
+    }
+}
 
-Post-Migration Challenges
-
-While the migration eliminated infrastructure dependencies, a few new issues emerged due to the nature of the serverless environment:
-	1.	Cold Start Failures:
-Occasionally, the function failed to start on schedule because of cold start delays in the Function App.
-	2.	Module Download Issues:
-During cold starts, PowerShell modules sometimes failed to download correctly, causing the function to terminate before execution.
-	3.	Missed Runs:
-Since the function was scheduled only once per day, a failed execution meant data was skipped entirely for that day.
-
-⸻
-
-Implementation of Self-Healing Mechanism
-
-To address these challenges, a new “Monitoring and Self-Healing Script” was developed and deployed as a separate Azure Function.
-
-Key Responsibilities
-	1.	Storage Verification:
-The script runs multiple times daily (five times a day) to validate the presence of all expected log files in the storage account.
-	2.	File Validation:
-It checks for files generated for all five tenants and ensures each file is present with the correct timestamp/date.
-	3.	Automated Recovery:
-If any file for a tenant is missing or incomplete, the script automatically re-triggers the corresponding log generation function for that tenant.
-	4.	Notification System:
-It sends an automated email alert to the engineering team, informing them of the missing file(s) and the triggered recovery action.
-
-⸻
-
-Benefits and Impact
-	1.	Zero Manual Intervention:
-The system now auto-heals — failed or missed executions are automatically re-run without human involvement.
-	2.	Improved Reliability:
-Each tenant’s logs are guaranteed to be generated daily, ensuring 100% data consistency.
-	3.	No Infrastructure Dependency:
-The move to serverless Azure Functions removed reliance on VMs and hybrid workers.
-	4.	Operational Efficiency:
-The engineering and SRE teams no longer need to monitor or manually trigger re-runs, reducing daily operational load.
-	5.	Incident Reduction:
-The setup achieved zero incidents related to missing or failed log generations, significantly improving reliability KPIs.
-
-⸻
-
-Architecture Overview
-
-Components Involved:
-	•	Azure Functions (Primary): Generates Azure and Azure AD logs for each tenant.
-	•	Azure Storage Account: Stores the generated log files.
-	•	Azure Functions (Monitoring): Periodically verifies file presence and triggers re-runs if required.
-	•	Email Notification Logic: Sends alerts on missing or inconsistent files.
-
-Execution Frequency:
-	•	Log generation: Once daily per tenant
-	•	Monitoring/self-healing: Five times per day
-
-Triggering Mechanisms:
-	•	CRON-based schedule for both primary and monitoring functions.
-
-⸻
-
-Outcome
-
-This migration and enhancement significantly improved the system’s stability, maintainability, and resilience.
-By introducing self-healing capabilities and moving to serverless architecture, the team achieved:
-	•	100% successful log generation rate
-	•	Zero incidents raised
-	•	Reduced operational overhead
+$mResults
