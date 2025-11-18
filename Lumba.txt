@@ -1,38 +1,35 @@
 Import-Module Az.ResourceGraph
 
-# Get all subscriptions from Azure
 $subs = Get-AzSubscription
 
 $FilteredSubs = foreach ($sub in $subs) {
 
     $subId = $sub.Id
 
-    # Query resource graph
     $result = Search-AzGraph -Query @"
 resourcecontainers
 | where type == 'microsoft.resources/subscriptions'
-| where properties.subscriptionId == '$subId'
-| extend Parent = properties.managementGroupAncestorsChain[0]
-| project subscriptionId = tostring(properties.subscriptionId),
+| where subscriptionId == '$subId'
+| extend chain = properties.managementGroupAncestorsChain
+| extend parentMG = tostring(chain[0].displayName)
+| project subscriptionId = tostring(subscriptionId),
           subscriptionName = tostring(name),
-          parentMG = tolower(tostring(Parent.properties.displayName))
+          parentMG
 "@
 
-    # If nothing returned, skip
     if (-not $result) { continue }
 
-    $parentMG = $result.parentMG
+    $parent = $result.parentMG.ToLower()
 
-    # Skip subscriptions with parent MG having "decommissioned" (case-insensitive)
-    if ($parentMG -like "*decommissioned*") {
-        Write-Host "IGNORED: $($result.subscriptionName) → Parent MG: $parentMG"
+    if ($parent -like "*decommissioned*") {
+        Write-Host "IGNORED: $($result.subscriptionName) → Parent: $parent"
         continue
     }
 
-    # Return only valid subscriptions
+    # Keep this subscription
     $sub
 }
 
 Write-Host ""
-Write-Host "============== FINAL SUBSCRIPTIONS =============="
+Write-Host "============== FINAL SUBSCRIPTIONS (AFTER FILTER) =============="
 $FilteredSubs | Select-Object Name, Id | Format-Table
