@@ -1,30 +1,38 @@
-# This query returns subscription + its immediate parent MG only
-$query = @"
+Import-Module Az.ResourceGraph
+
+# Get all subscriptions from Azure
+$subs = Get-AzSubscription
+
+$FilteredSubs = foreach ($sub in $subs) {
+
+    $subId = $sub.Id
+
+    # Query resource graph
+    $result = Search-AzGraph -Query @"
 resourcecontainers
 | where type == 'microsoft.resources/subscriptions'
-| extend chain = properties.managementGroupAncestorsChain
-| mv-expand anc = chain
-| where anc.properties.level == 1        // immediate parent ONLY
+| where properties.subscriptionId == '$subId'
+| extend Parent = properties.managementGroupAncestorsChain[0]
 | project subscriptionId = tostring(properties.subscriptionId),
           subscriptionName = tostring(name),
-          parentMGName = tostring(anc.name),
-          parentMGDisplayName = tostring(anc.properties.displayName)
+          parentMG = tolower(tostring(Parent.properties.displayName))
 "@
 
-$allSubsWithParents = Search-AzGraph -Query $query
+    # If nothing returned, skip
+    if (-not $result) { continue }
 
-# Filter out the ones with parent MG containing "decommissioned"
-$filtered = $allSubsWithParents | Where-Object {
-    $_.parentMGDisplayName -notmatch "decommissioned"
+    $parentMG = $result.parentMG
+
+    # Skip subscriptions with parent MG having "decommissioned" (case-insensitive)
+    if ($parentMG -like "*decommissioned*") {
+        Write-Host "IGNORED: $($result.subscriptionName) → Parent MG: $parentMG"
+        continue
+    }
+
+    # Return only valid subscriptions
+    $sub
 }
 
-# Show what will be IGNORED
-$ignored = $allSubsWithParents | Where-Object {
-    $_.parentMGDisplayName -match "decommissioned"
-}
-
-Write-Host "----- Ignored Subscriptions (Parent MG: Decommissioned) -----`n"
-$ignored | Format-Table subscriptionId, subscriptionName, parentMGDisplayName -AutoSize
-
-Write-Host "`n----- FINAL SUBSCRIPTIONS TO PROCESS -----`n"
-$filtered | Format-Table subscriptionId, subscriptionName, parentMGDisplayName -AutoSize
+Write-Host ""
+Write-Host "============== FINAL SUBSCRIPTIONS =============="
+$FilteredSubs | Select-Object Name, Id | Format-Table
