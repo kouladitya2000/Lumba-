@@ -1,110 +1,30 @@
-# =========================
-# KeyVault Enumeration Script
-# =========================
+# This query returns subscription + its immediate parent MG only
+$query = @"
+resourcecontainers
+| where type == 'microsoft.resources/subscriptions'
+| extend chain = properties.managementGroupAncestorsChain
+| mv-expand anc = chain
+| where anc.properties.level == 1        // immediate parent ONLY
+| project subscriptionId = tostring(properties.subscriptionId),
+          subscriptionName = tostring(name),
+          parentMGName = tostring(anc.name),
+          parentMGDisplayName = tostring(anc.properties.displayName)
+"@
 
-$mResults = @()
-$mNoItem = ""
-if ($ReportOn -eq "KeyVaultKey") {
-    $mNoItem = "No Key"
-}
-else {
-    $mNoItem = "No Certificate"
-}
+$allSubsWithParents = Search-AzGraph -Query $query
 
-$mNoAccess = "NO ACCESS"
-
-$subscriptions = Get-AzSubscription
-foreach ($sub in $subscriptions) {
-
-    Set-AzContext -SubscriptionId $sub.Id | Out-Null
-
-    $mSubName     = (Get-AzContext).Subscription.Name
-    $mSubId       = (Get-AzContext).Subscription.Id
-    $mSubTenantId = (Get-AzContext).Subscription.TenantId
-
-    Write-Host "Reading KVs from $mSubName ($mSubId)"
-
-    $vaults = Search-AzGraph -Query "resources | where type =~ 'microsoft.keyvault/vaults'" -Subscription $mSubId -ErrorAction SilentlyContinue
-
-    if (-not $vaults) {
-        Write-Host "No KeyVaults found in $mSubName"
-        continue
-    }
-
-    foreach ($vault in $vaults) {
-
-        $strSPNKeyVaultName = $vault.name
-        $mResourceGroupName = $vault.resourceGroup
-
-        Write-Host "Reading $strSPNKeyVaultName"
-
-        try {
-            $objKeyVault = Get-AzKeyVault -VaultName $strSPNKeyVaultName -ErrorAction Stop
-
-            if ($ReportOn -eq "KeyVaultKey") {
-                $mKvItems = Get-AzKeyVaultKey -VaultName $strSPNKeyVaultName -ErrorAction SilentlyContinue
-            }
-            else {
-                $mKvItems = Get-AzKeyVaultCertificate -VaultName $strSPNKeyVaultName -ErrorAction SilentlyContinue
-            }
-
-            if ($mKvItems) {
-                foreach ($item in $mKvItems) {
-                    $mResults += [PSCustomObject]@{
-                        "Subscription_Name" = $mSubName
-                        "Subscription_Id"   = $mSubId
-                        "Tenant_Id"         = $mSubTenantId
-                        "VaultName"         = $strSPNKeyVaultName
-                        "ResourceGroupName" = $mResourceGroupName
-                        "KeyName"           = $item.Name
-                        "Created"           = $item.Attributes.Created
-                        "Expires"           = $item.Attributes.Expires
-                        "Enabled"           = $item.Attributes.Enabled
-                        "Version"           = if ($ReportOn -eq "KeyVaultKey") { ($item.Kid.Split('/')[-1]) } else { $item.Version }
-                        "Updated"           = $item.Attributes.Updated
-                        "Id"                = if ($ReportOn -eq "KeyVaultKey") { $item.Kid } else { $item.Id }
-                        "Permissions"       = ($objKeyVault.AccessPolicies | Select-Object DisplayName, ObjectId, PermissionsToKeys)
-                    }
-                }
-            }
-            else {
-                $mResults += [PSCustomObject]@{
-                    "Subscription_Name" = $mSubName
-                    "Subscription_Id"   = $mSubId
-                    "Tenant_Id"         = $mSubTenantId
-                    "VaultName"         = $strSPNKeyVaultName
-                    "ResourceGroupName" = $mResourceGroupName
-                    "KeyName"           = $mNoItem
-                    "Created"           = $mNoItem
-                    "Expires"           = $mNoItem
-                    "Enabled"           = $mNoItem
-                    "Version"           = $mNoItem
-                    "Updated"           = $mNoItem
-                    "Id"                = $mNoItem
-                    "Permissions"       = ($objKeyVault.AccessPolicies | Select-Object DisplayName, ObjectId, PermissionsToKeys)
-                }
-            }
-        }
-        catch {
-            Write-Host "Error: Unable to connect to KeyVault $strSPNKeyVaultName in subscription $mSubName - $($_.Exception.Message)"
-            Write-Host "Automation SPN does not have access to KeyVault $strSPNKeyVaultName to list keys"
-            $mResults += [PSCustomObject]@{
-                "Subscription_Name" = $mSubName
-                "Subscription_Id"   = $mSubId
-                "Tenant_Id"         = $mSubTenantId
-                "VaultName"         = $strSPNKeyVaultName
-                "ResourceGroupName" = $mResourceGroupName
-                "KeyName"           = $mNoAccess
-                "Created"           = $mNoAccess
-                "Expires"           = $mNoAccess
-                "Enabled"           = $mNoAccess
-                "Version"           = $mNoAccess
-                "Updated"           = $mNoAccess
-                "Id"                = $mNoAccess
-                "Permissions"       = $null
-            }
-        }
-    }
+# Filter out the ones with parent MG containing "decommissioned"
+$filtered = $allSubsWithParents | Where-Object {
+    $_.parentMGDisplayName -notmatch "decommissioned"
 }
 
-$mResults
+# Show what will be IGNORED
+$ignored = $allSubsWithParents | Where-Object {
+    $_.parentMGDisplayName -match "decommissioned"
+}
+
+Write-Host "----- Ignored Subscriptions (Parent MG: Decommissioned) -----`n"
+$ignored | Format-Table subscriptionId, subscriptionName, parentMGDisplayName -AutoSize
+
+Write-Host "`n----- FINAL SUBSCRIPTIONS TO PROCESS -----`n"
+$filtered | Format-Table subscriptionId, subscriptionName, parentMGDisplayName -AutoSize
