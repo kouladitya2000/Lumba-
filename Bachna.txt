@@ -1,0 +1,23 @@
+resource "azurerm_monitor_autoscale_setting" "automation_zonal" {
+  name                = "${local.deploy_name}-autoscale"
+  resource_group_name = azurerm_resource_group.automation.name
+  location            = azurerm_resource_group.automation.location
+  target_resource_id  = azurerm_service_plan.automation.id
+
+  profile {
+    name = "zonal-profile"
+
+    capacity {
+      minimum = "2"
+      maximum = "10"
+      default = "2"
+    }
+
+    # THE REAL “Zone Redundancy”
+    zones {
+      values = ["1", "2", "3"]
+    }
+  }
+
+  notifications {}
+}
