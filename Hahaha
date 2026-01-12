@@ -1,0 +1,32 @@
+$resultHTMLString = @"
+<html>
+<body>
+    Hi,<br><br>
+
+    <p>Please find the DDoS CSV report status below:</p>
+
+    <p><b>Storage Account:</b> $storageAccountName</p>
+    <p><b>Container Name:</b> $containerName</p>
+
+    <p><b>Files generated:</b></p>
+    <ul>
+        $generatedFilesHtml
+    </ul>
+
+    $missingSectionHtml
+
+    <br>
+    <p>
+        Link:
+        <a href="https://portal.azure.com/#view/Microsoft_Azure_Storage/ContainerMenuBlade/~/overview/storageAccountId/$storageAccountId">
+            Open Storage Container
+        </a>
+    </p>
+
+    <br>
+    Thanks,<br>
+    Azure Function<br>
+    <i>(This is a system generated email. Please do not reply.)</i>
+</body>
+</html>
+"@
