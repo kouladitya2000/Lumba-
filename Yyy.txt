@@ -1,0 +1,36 @@
+# Ensure Az module is available
+Import-Module Az.Accounts
+Import-Module Az.Resources
+
+# Tag name holding the EIM ID
+$TagName = "EIMID"
+
+# HashSet for uniqueness (fast + no redundancy)
+$UniqueEIMs = [System.Collections.Generic.HashSet[string]]::new()
+
+# Get all subscriptions in the tenant
+$Subscriptions = Get-AzSubscription
+
+foreach ($Sub in $Subscriptions) {
+
+    # Switch context to subscription
+    Set-AzContext -SubscriptionId $Sub.Id | Out-Null
+
+    # Get subscription tags
+    $SubDetails = Get-AzSubscription -SubscriptionId $Sub.Id
+
+    if ($SubDetails.Tags -and $SubDetails.Tags.ContainsKey($TagName)) {
+
+        $EIMValue = $SubDetails.Tags[$TagName]
+
+        # Add to HashSet (automatically avoids duplicates)
+        [void]$UniqueEIMs.Add($EIMValue)
+    }
+}
+
+# Print EIM IDs line by line
+Write-Host "Unique EIM IDs found:`n"
+
+$UniqueEIMs | Sort-Object | ForEach-Object {
+    Write-Host $_
+}
