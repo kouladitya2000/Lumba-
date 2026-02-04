@@ -1,36 +1,68 @@
-# Ensure Az module is available
-Import-Module Az.Accounts
-Import-Module Az.Resources
+# ================= API CONFIG =================
+$BaseUrl = "https://qcs-cods-api-dev.hc.cloud.uk.labubu:8085/api/v1/fetch-iaas-dbs"
 
-# Tag name holding the EIM ID
-$TagName = "EIMID"
+$Headers = @{
+    "accept"        = "application/json"
+    "Authorization" = "Basic YWRhYW46c3VwZXJwZXQxMjM="
+}
 
-# HashSet for uniqueness (fast + no redundancy)
-$UniqueEIMs = [System.Collections.Generic.HashSet[string]]::new()
+# ================= RESULT BUCKETS =================
+$GuardiumMissing = [System.Collections.Generic.HashSet[string]]::new()
+$GuardiumPresent = [System.Collections.Generic.HashSet[string]]::new()
 
-# Get all subscriptions in the tenant
-$Subscriptions = Get-AzSubscription
+# ================= API INGESTION =================
+foreach ($eim in $UniqueEIMs) {
 
-foreach ($Sub in $Subscriptions) {
+    Write-Host "`nChecking EIM ID: $eim"
 
-    # Switch context to subscription
-    Set-AzContext -SubscriptionId $Sub.Id | Out-Null
+    $Uri = "$BaseUrl?page=1&size=50&csp_name=azure&eim_id=$eim"
 
-    # Get subscription tags
-    $SubDetails = Get-AzSubscription -SubscriptionId $Sub.Id
+    try {
+        $Response = Invoke-RestMethod `
+            -Uri $Uri `
+            -Method GET `
+            -Headers $Headers
 
-    if ($SubDetails.Tags -and $SubDetails.Tags.ContainsKey($TagName)) {
+        # If API returns no records
+        if (-not $Response.result -or $Response.result.Count -eq 0) {
+            Write-Host "⚠️ No records returned for this EIM ID"
+            $GuardiumMissing.Add($eim) | Out-Null
+            continue
+        }
 
-        $EIMValue = $SubDetails.Tags[$TagName]
+        $GuardiumFound = $false
 
-        # Add to HashSet (automatically avoids duplicates)
-        [void]$UniqueEIMs.Add($EIMValue)
+        foreach ($item in $Response.result) {
+            if ($null -ne $item.guardium_agent -and $item.guardium_agent -ne "") {
+                $GuardiumFound = $true
+                break
+            }
+        }
+
+        if ($GuardiumFound) {
+            Write-Host "✅ Guardium present"
+            $GuardiumPresent.Add($eim) | Out-Null
+        }
+        else {
+            Write-Host "❌ Guardium NOT present"
+            $GuardiumMissing.Add($eim) | Out-Null
+        }
+
+    } catch {
+        Write-Host "🚨 API call failed for EIM ID: $eim"
+        Write-Host $_
     }
 }
 
-# Print EIM IDs line by line
-Write-Host "Unique EIM IDs found:`n"
+# ================= FINAL SUMMARY =================
+Write-Host "`n================ SUMMARY ================"
 
-$UniqueEIMs | Sort-Object | ForEach-Object {
+Write-Host "`n❌ Guardium MISSING (action needed):"
+$GuardiumMissing | Sort-Object | ForEach-Object {
+    Write-Host $_
+}
+
+Write-Host "`n✅ Guardium PRESENT:"
+$GuardiumPresent | Sort-Object | ForEach-Object {
     Write-Host $_
 }
