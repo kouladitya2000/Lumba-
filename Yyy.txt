@@ -1,113 +1,17 @@
-# =========================
-# API CALL
-# =========================
-$uri = "https://your-api-url-here"
-
-$headers = @{
-    Authorization = "Basic $encoded"
-    Accept        = "application/json"
-}
-
-$response = Invoke-RestMethod -Uri $uri -Method GET -Headers $headers
-
-
-# =========================
-# MORTGAGE FILTER (UNCHANGED)
-# =========================
-$mortgageEIMs = @("6381792")
-
-$mortgageRecords = $response.result |
-    Where-Object { $mortgageEIMs -contains $_.eim_id }
-
-
-# =========================
-# NON-COMPLIANT FILTER (UNCHANGED)
-# =========================
-$nonCompliantRecords = @()
-
-foreach ($record in $mortgageRecords) {
-
-    $guardiumAgentValue = $record.guardium_agent
-
-    if ([string]::IsNullOrWhiteSpace($guardiumAgentValue) -or
-        $guardiumAgentValue -eq "notinstalled")
-    {
-        $nonCompliantRecords += $record
-        Write-Host "NON-COMPLIANT | Instance: $($record.instance_name)"
-    }
-    else {
-        Write-Host "COMPLIANT | Instance: $($record.instance_name)"
-    }
-}
-
-Write-Host "`nTotal Non-Compliant Records: $($nonCompliantRecords.Count)`n"
-
-
-# =========================
-# FINAL RESULTS (NO LOOKUP TABLE)
-# =========================
-$finalResults = @()
-
-foreach ($record in $nonCompliantRecords) {
-
-    $vmName         = $record.instance_name
-    $subscriptionId = $record.account_project_subscription_id
-
-    $kqlQuery = @"
 Resources
-| where type =~ 'microsoft.compute/virtualmachines'
-| where subscriptionId == '$subscriptionId'
-| where name == '$vmName'
+| where type in~ (
+    'microsoft.compute/virtualmachines',
+    'microsoft.sqlvirtualmachine/sqlvirtualmachines'
+)
+| join kind=leftouter (
+    ResourceContainers
+    | where type == 'microsoft.resources/subscriptions'
+    | project subscriptionId, managementGroupId
+) on subscriptionId
 | project
-    tenantId,
-    subscriptionId,
-    resourceGroup,
-    id,
     name,
-    type
-"@
-
-    $vm = Search-AzGraph -Query $kqlQuery -First 1
-
-    if (-not $vm) {
-        Write-Warning "Azure resource not found for VM: $vmName"
-        continue
-    }
-
-    $finalResults += [PSCustomObject]@{
-        ScriptAssignmentName        = "audit_guardium_agent"
-        ScriptAssignmentId          = "audit_guardium_agent"
-        ScriptDefinitionName        = "audit_guardium_agent"
-        ScriptDefinitionId          = "audit_guardium_agent"
-        ScriptSetDefinitionName     = "audit_guardium_agent"
-        ScriptSetDefinitionId       = "audit_guardium_agent"
-        policyDefinitionReferenceId = "audit_guardium_agent"
-
-        IsCompliant     = $false
-        ComplianceState = $record.compliance_status
-
-        Timestamp       = (Get-Date).ToString("o")
-
-        TenantId        = $vm.tenantId
-        SubscriptionId  = $vm.subscriptionId
-        ResourceGroup   = $vm.resourceGroup
-        ResourceType    = $vm.type
-        ResourceId      = $vm.id
-
-        VmName          = $record.instance_name
-        InstanceId      = $record.instance_id
-        GuardiumAgent   = $record.guardium_agent
-    }
-}
-
-
-# =========================
-# EXPORT
-# =========================
-$csvPath = "C:\Temp\Guardium_Mortgage_NonCompliant_Report.csv"
-
-$finalResults |
-    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-
-Write-Host "`nReport generated successfully:"
-Write-Host $csvPath
+    id,
+    type,
+    subscriptionId,
+    managementGroupId,
+    resourceGroup
