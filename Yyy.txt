@@ -1,78 +1,156 @@
-# -------------------------------
-# STEP 1: Identify NON-COMPLIANT records
-# Rule: guardium_agent is NULL or EMPTY
-# -------------------------------
+# =========================
+# COLLECTION TIME LOGIC
+# =========================
+$currentTime = Get-Date
 
-$NonCompliantRecords = $response.result | Where-Object {
-    [string]::IsNullOrWhiteSpace($_.guardium_agent)
+if ($currentTime.Hour -ge 2 -and $currentTime.Hour -lt 10) {
+    $collectionTime = Get-Date -Hour 3 -Minute 0 -Second 0
+}
+elseif ($currentTime.Hour -ge 11 -and $currentTime.Hour -lt 19) {
+    $collectionTime = Get-Date -Hour 11 -Minute 0 -Second 0
+}
+else {
+    $collectionTime = Get-Date -Hour 19 -Minute 0 -Second 0
 }
 
-# If nothing is non-compliant, stop early
-if (-not $NonCompliantRecords) {
-    Write-Output "No non-compliant records found."
+Write-Host "Collection Time: $collectionTime"
+
+
+# =========================
+# API CONFIG & CALL
+# =========================
+$baseUrl = "https://gcs-cods-api-dev.hc.cloud.uk.labubu:8085/api/v1/fetch-iaas-dbs"
+
+$uriBuilder = [System.UriBuilder]::new($baseUrl)
+$uriBuilder.Query = "page=1&size=50&csp_name=azure"
+$uri = $uriBuilder.Uri
+
+$pair    = "admin:supersecret123"
+$encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+
+$headers = @{
+    Authorization = "Basic $encoded"
+    Accept        = "application/json"
+}
+
+$response = Invoke-RestMethod -Uri $uri -Method GET -Headers $headers
+$apiRecords = $response.result
+
+
+# =========================
+# FILTER NON-COMPLIANT (API TRUTH)
+# =========================
+$nonCompliantRecords = foreach ($record in $apiRecords) {
+
+    if ([string]::IsNullOrWhiteSpace($record.guardium_agent) -or
+        $record.guardium_agent -eq "notinstalled")
+    {
+        Write-Host "NON-COMPLIANT | $($record.instance_name)"
+        $record
+    }
+}
+
+Write-Host "`nTotal non-compliant VMs: $($nonCompliantRecords.Count)`n"
+
+
+# =========================
+# BUILD VM NAME FILTER FOR KQL
+# =========================
+$vmNames = $nonCompliantRecords.instance_name | Sort-Object -Unique
+
+if (-not $vmNames) {
+    Write-Host "No non-compliant VMs found. Exiting."
     return
 }
 
-# -------------------------------
-# STEP 2: Extract VM names from NON-COMPLIANT records
-# -------------------------------
+$vmNameFilter = ($vmNames | ForEach-Object { "'$_'" }) -join ","
 
-$NonCompliantVMNames = $NonCompliantRecords |
-    Select-Object -ExpandProperty instance_name -Unique
 
-# Build KQL-compatible IN list
-$vmNameFilter = ($NonCompliantVMNames | ForEach-Object { "'$_'" }) -join ","
-
-# -------------------------------
-# STEP 3: Build KQL query
-# -------------------------------
-
+# =========================
+# AZURE RESOURCE GRAPH (KQL)
+# =========================
 $kqlQuery = @"
 Resources
-| where type == 'microsoft.compute/virtualmachines'
+| where type =~ 'microsoft.compute/virtualmachines'
 | where name in ($vmNameFilter)
 | project
     tenantId,
     subscriptionId,
+    resourceGroup,
     id,
     name,
     type
 "@
 
-# -------------------------------
-# STEP 4: Query Azure Resource Graph
-# -------------------------------
-
 $vmResources = Search-AzGraph -Query $kqlQuery -First 1000
 
-# -------------------------------
-# STEP 5: Build FINAL compliance output
-# (ONLY for non-compliant VMs)
-# -------------------------------
 
-$finalResults = @()
+# =========================
+# BUILD LOOKUP TABLE (FAST JOIN)
+# =========================
+$vmLookup = @{}
 
 foreach ($vm in $vmResources) {
-    $finalResults += [PSCustomObject]@{
-        CollectionTimestamp              = $collectionTime
-        TimeStamp                        = $now
-        TenantId                         = $vm.tenantId
-        SubscriptionId                  = $vm.subscriptionId
-        ManagementGroupIds              = $null
-        ResourceType                    = $vm.type
-        ResourceId                      = $vm.id
-        IsCompliant                     = $false
-        ComplianceState                 = "NonCompliant"
-        ScriptAssignmentName            = "audit_guardium_agent"
-        ScriptAssignmentId              = "audit_guardium_agent"
-        ScriptDefinitionName            = "audit_guardium_agent"
-        ScriptDefinitionId              = "audit_guardium_agent"
-        ScriptSetDefinitionName         = "audit_guardium_agent"
-        ScriptSetDefinitionId           = "audit_guardium_agent"
-        PolicyDefinitionReferenceId     = "audit_guardium_agent"
+    $key = "$($vm.subscriptionId)|$($vm.name)"
+    $vmLookup[$key] = $vm
+}
+
+
+# =========================
+# BUILD FINAL POLICY-ACCURATE RESULTS
+# =========================
+$finalResults = foreach ($record in $nonCompliantRecords) {
+
+    $lookupKey = "$($record.account_project_subscription_id)|$($record.instance_name)"
+    $vm = $vmLookup[$lookupKey]
+
+    if (-not $vm) {
+        Write-Warning "Azure VM not found in ARG: $($record.instance_name)"
+        continue
+    }
+
+    [PSCustomObject]@{
+        # ---- POLICY CONSTANTS ----
+        ScriptAssignmentName        = "audit_guardium_agent"
+        ScriptAssignmentId          = "audit_guardium_agent"
+        ScriptDefinitionName        = "audit_guardium_agent"
+        ScriptDefinitionId          = "audit_guardium_agent"
+        ScriptSetDefinitionName     = "audit_guardium_agent"
+        ScriptSetDefinitionId       = "audit_guardium_agent"
+        policyDefinitionReferenceId = "audit_guardium_agent"
+
+        # ---- COMPLIANCE (API) ----
+        IsCompliant     = $false
+        ComplianceState = $record.compliance_status
+
+        # ---- TIME ----
+        Timestamp       = (Get-Date).ToString("o")
+        CollectionTime  = $collectionTime.ToString("o")
+
+        # ---- AZURE TRUTH (KQL) ----
+        TenantId        = $vm.tenantId
+        SubscriptionId  = $vm.subscriptionId
+        ResourceGroup   = $vm.resourceGroup
+        ResourceType    = $vm.type
+        ResourceId      = $vm.id
+
+        # ---- CONTEXT (OPTIONAL, GOOD FOR CSV) ----
+        VmName          = $record.instance_name
+        InstanceId      = $record.instance_id
+        GuardiumAgent   = $record.guardium_agent
+        ScanStatus      = $record.scan_status
+        ScanTimestamp   = $record.scan_timestamp
     }
 }
 
-# -------------------------------
-# FINAL OBJECT: $finalResults
-# -------------------------------
+
+# =========================
+# EXPORT CSV
+# =========================
+$csvPath = "C:\Temp\Guardium_NonCompliant_Report.csv"
+
+$finalResults |
+    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "`nReport generated successfully:"
+Write-Host $csvPath
