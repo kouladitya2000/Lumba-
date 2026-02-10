@@ -1,32 +1,7 @@
 # =========================
-# COLLECTION TIME LOGIC
+# API CALL
 # =========================
-$currentTime = Get-Date
-
-if ($currentTime.Hour -ge 2 -and $currentTime.Hour -lt 10) {
-    $collectionTime = Get-Date -Hour 3 -Minute 0 -Second 0
-}
-elseif ($currentTime.Hour -ge 11 -and $currentTime.Hour -lt 19) {
-    $collectionTime = Get-Date -Hour 11 -Minute 0 -Second 0
-}
-else {
-    $collectionTime = Get-Date -Hour 19 -Minute 0 -Second 0
-}
-
-Write-Host "Collection Time: $collectionTime"
-
-
-# =========================
-# API CONFIG & CALL
-# =========================
-$baseUrl = "https://gcs-cods-api-dev.hc.cloud.uk.labubu:8085/api/v1/fetch-iaas-dbs"
-
-$uriBuilder = [System.UriBuilder]::new($baseUrl)
-$uriBuilder.Query = "page=1&size=50&csp_name=azure"
-$uri = $uriBuilder.Uri
-
-$pair    = "admin:supersecret123"
-$encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+$uri = "https://your-api-url-here"
 
 $headers = @{
     Authorization = "Basic $encoded"
@@ -34,45 +9,55 @@ $headers = @{
 }
 
 $response = Invoke-RestMethod -Uri $uri -Method GET -Headers $headers
-$apiRecords = $response.result
 
 
 # =========================
-# FILTER NON-COMPLIANT (API TRUTH)
+# MORTGAGE FILTER (UNCHANGED)
 # =========================
-$nonCompliantRecords = foreach ($record in $apiRecords) {
+$mortgageEIMs = @("6381792")
 
-    if ([string]::IsNullOrWhiteSpace($record.guardium_agent) -or
-        $record.guardium_agent -eq "notinstalled")
+$mortgageRecords = $response.result |
+    Where-Object { $mortgageEIMs -contains $_.eim_id }
+
+
+# =========================
+# NON-COMPLIANT FILTER (UNCHANGED)
+# =========================
+$nonCompliantRecords = @()
+
+foreach ($record in $mortgageRecords) {
+
+    $guardiumAgentValue = $record.guardium_agent
+
+    if ([string]::IsNullOrWhiteSpace($guardiumAgentValue) -or
+        $guardiumAgentValue -eq "notinstalled")
     {
-        Write-Host "NON-COMPLIANT | $($record.instance_name)"
-        $record
+        $nonCompliantRecords += $record
+        Write-Host "NON-COMPLIANT | Instance: $($record.instance_name)"
+    }
+    else {
+        Write-Host "COMPLIANT | Instance: $($record.instance_name)"
     }
 }
 
-Write-Host "`nTotal non-compliant VMs: $($nonCompliantRecords.Count)`n"
+Write-Host "`nTotal Non-Compliant Records: $($nonCompliantRecords.Count)`n"
 
 
 # =========================
-# BUILD VM NAME FILTER FOR KQL
+# FINAL RESULTS (NO LOOKUP TABLE)
 # =========================
-$vmNames = $nonCompliantRecords.instance_name | Sort-Object -Unique
+$finalResults = @()
 
-if (-not $vmNames) {
-    Write-Host "No non-compliant VMs found. Exiting."
-    return
-}
+foreach ($record in $nonCompliantRecords) {
 
-$vmNameFilter = ($vmNames | ForEach-Object { "'$_'" }) -join ","
+    $vmName         = $record.instance_name
+    $subscriptionId = $record.account_project_subscription_id
 
-
-# =========================
-# AZURE RESOURCE GRAPH (KQL)
-# =========================
-$kqlQuery = @"
+    $kqlQuery = @"
 Resources
 | where type =~ 'microsoft.compute/virtualmachines'
-| where name in ($vmNameFilter)
+| where subscriptionId == '$subscriptionId'
+| where name == '$vmName'
 | project
     tenantId,
     subscriptionId,
@@ -82,35 +67,14 @@ Resources
     type
 "@
 
-$vmResources = Search-AzGraph -Query $kqlQuery -First 1000
-
-
-# =========================
-# BUILD LOOKUP TABLE (FAST JOIN)
-# =========================
-$vmLookup = @{}
-
-foreach ($vm in $vmResources) {
-    $key = "$($vm.subscriptionId)|$($vm.name)"
-    $vmLookup[$key] = $vm
-}
-
-
-# =========================
-# BUILD FINAL POLICY-ACCURATE RESULTS
-# =========================
-$finalResults = foreach ($record in $nonCompliantRecords) {
-
-    $lookupKey = "$($record.account_project_subscription_id)|$($record.instance_name)"
-    $vm = $vmLookup[$lookupKey]
+    $vm = Search-AzGraph -Query $kqlQuery -First 1
 
     if (-not $vm) {
-        Write-Warning "Azure VM not found in ARG: $($record.instance_name)"
+        Write-Warning "Azure resource not found for VM: $vmName"
         continue
     }
 
-    [PSCustomObject]@{
-        # ---- POLICY CONSTANTS ----
+    $finalResults += [PSCustomObject]@{
         ScriptAssignmentName        = "audit_guardium_agent"
         ScriptAssignmentId          = "audit_guardium_agent"
         ScriptDefinitionName        = "audit_guardium_agent"
@@ -119,35 +83,28 @@ $finalResults = foreach ($record in $nonCompliantRecords) {
         ScriptSetDefinitionId       = "audit_guardium_agent"
         policyDefinitionReferenceId = "audit_guardium_agent"
 
-        # ---- COMPLIANCE (API) ----
         IsCompliant     = $false
         ComplianceState = $record.compliance_status
 
-        # ---- TIME ----
         Timestamp       = (Get-Date).ToString("o")
-        CollectionTime  = $collectionTime.ToString("o")
 
-        # ---- AZURE TRUTH (KQL) ----
         TenantId        = $vm.tenantId
         SubscriptionId  = $vm.subscriptionId
         ResourceGroup   = $vm.resourceGroup
         ResourceType    = $vm.type
         ResourceId      = $vm.id
 
-        # ---- CONTEXT (OPTIONAL, GOOD FOR CSV) ----
         VmName          = $record.instance_name
         InstanceId      = $record.instance_id
         GuardiumAgent   = $record.guardium_agent
-        ScanStatus      = $record.scan_status
-        ScanTimestamp   = $record.scan_timestamp
     }
 }
 
 
 # =========================
-# EXPORT CSV
+# EXPORT
 # =========================
-$csvPath = "C:\Temp\Guardium_NonCompliant_Report.csv"
+$csvPath = "C:\Temp\Guardium_Mortgage_NonCompliant_Report.csv"
 
 $finalResults |
     Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
