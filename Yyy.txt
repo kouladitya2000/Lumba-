@@ -1,101 +1,186 @@
-# ================= API CONFIG =================
-$baseUrl = "https://gcs-cods-api-dev.hc.cloud.uk.labubu:8085/api/v1/fetch-iaas-dbs"
+param($Timer)
 
-$uriBuilder = [System.UriBuilder]::new($baseUrl)
-$uriBuilder.Query = "page=1&size=50&csp_name=azure"
-$uri = $uriBuilder.Uri.AbsoluteUri
+try {
 
-$pair = "admin:supersecret123"
-$encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+    Write-Host "Function started."
 
-$headers = @{
-    Authorization = "Basic $encoded"
-    Accept        = "application/json"
-}
+    # ==========================================================
+    # CONFIGURATION
+    # ==========================================================
 
-$response = Invoke-RestMethod -Uri $uri -Method GET -Headers $headers
+    $TenantId = "<YOUR_TENANT_ID>"
+    $outputFileFullPath = "NonCompliantVMs_$TenantId.csv"
 
-# ================= MORTGAGE FILTER =================
-$mortgageEIMs = @("63B1792")
-$mortgageRecords = $response.result | Where-Object {
-    $mortgageEIMs -contains $_.eim_id
-}
+    # ==========================================================
+    # ALWAYS CREATE FILE WITH HEADER
+    # ==========================================================
 
-# ================= NON-COMPLIANT FILTER =================
-$nonCompliantRecords = @()
+    $header = "VMName,SubscriptionId,ResourceGroup,ManagementGroupId,ResourceId,GuardiumStatus,EIMId,TenantId"
+    $header | Out-File -FilePath $outputFileFullPath -Encoding utf8 -Force
 
-foreach ($record in $mortgageRecords) {
-    if ([string]::IsNullOrWhiteSpace($record.guardium_agent) -or
-        $record.guardium_agent -eq "notinstalled") {
-        $nonCompliantRecords += $record
+    # ==========================================================
+    # STEP 1: CALL API
+    # ==========================================================
+
+    try {
+
+        $apiHeaders = @{
+            "Content-Type"  = "application/json"
+            "Authorization" = "Bearer $AccessToken"
+        }
+
+        $response = Invoke-RestMethod -Uri $ApiUrl -Method Get -Headers $apiHeaders
+
+        if (-not $response) {
+            Write-Host "API returned empty response."
+            return
+        }
+
     }
-}
+    catch {
+        Write-Error "API call failed: $_"
+        return
+    }
 
-# ================= RESOURCE GRAPH : VM LOOKUP =================
-$vmQuery = @"
+    # ==========================================================
+    # STEP 2: FILTER BY TENANT
+    # ==========================================================
+
+    $tenantRecords = $response | Where-Object {
+        ($_."project_name" -split "/")[0] -eq $TenantId
+    }
+
+    if (-not $tenantRecords) {
+        Write-Host "No records found for Tenant: $TenantId"
+        return
+    }
+
+    # ==========================================================
+    # STEP 3: EXTRACT VM NAMES
+    # ==========================================================
+
+    $vmNames = $tenantRecords |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_.instance_name) } |
+        Select-Object -ExpandProperty instance_name -Unique
+
+    if (-not $vmNames) {
+        Write-Host "No VM names found in API response."
+        return
+    }
+
+    # ==========================================================
+    # STEP 4: QUERY ONLY REQUIRED VMs FROM AZURE
+    # ==========================================================
+
+    $vmNameList = $vmNames | ForEach-Object { "'$_'" } -join ","
+
+    $vmQuery = @"
 Resources
 | where type =~ 'microsoft.compute/virtualmachines'
-| project vmName = name, vmId = id, subscriptionId, resourceGroup
+| where name in ($vmNameList)
+| project name, resourceGroup, subscriptionId, id
 "@
 
-$vmResults = Search-AzGraph -Query $vmQuery -First 5000
+    try {
+        $vmResults = Search-AzGraph -Query $vmQuery
+    }
+    catch {
+        Write-Error "VM Resource Graph query failed: $_"
+        return
+    }
 
-$vmMap = @{}
-foreach ($vm in $vmResults) {
-    $key = "$($vm.subscriptionId)|$($vm.vmName.ToLower())"
-    $vmMap[$key] = $vm
-}
+    if (-not $vmResults) {
+        Write-Host "No matching Azure VMs found."
+        return
+    }
 
-# ================= RESOURCE GRAPH : MANAGEMENT GROUP =================
-$mgQuery = @"
+    # ==========================================================
+    # STEP 5: CREATE VM LOOKUP MAP
+    # ==========================================================
+
+    $vmMap = @{}
+    foreach ($vm in $vmResults) {
+        $vmMap[$vm.name] = $vm
+    }
+
+    # ==========================================================
+    # STEP 6: MANAGEMENT GROUP QUERY + LOOKUP MAP
+    # ==========================================================
+
+    $mgQuery = @"
 ResourceContainers
-| where type == 'microsoft.resources/subscriptions'
-| project subscriptionId, managementGroupId
+| where type =~ 'microsoft.resources/subscriptions'
+| project subscriptionId,
+          managementGroupId = properties.managementGroupAncestorsChain[-1].name
 "@
 
-$mgResults = Search-AzGraph -Query $mgQuery -First 5000
-
-$mgMap = @{}
-foreach ($mg in $mgResults) {
-    $mgMap[$mg.subscriptionId] = $mg.managementGroupId
-}
-
-# ================= FINAL RESULTS =================
-$finalResults = @()
-
-foreach ($record in $nonCompliantRecords) {
-
-    $vmName = $record.instance_name
-    $subId  = $record.account_project_subscription_id
-    $key    = "$subId|$($vmName.ToLower())"
-
-    if (-not $vmMap.ContainsKey($key)) {
-        Write-Warning "Azure resource not found for VM: $vmName"
-        continue
+    try {
+        $mgResults = Search-AzGraph -Query $mgQuery
+    }
+    catch {
+        Write-Error "Management Group query failed: $_"
+        return
     }
 
-    $vm = $vmMap[$key]
-
-    $finalResults += [PSCustomObject]@{
-        CollectionTimestamp   = (Get-Date).ToString("o")
-        SubscriptionId        = $subId
-        ManagementGroupId     = $mgMap[$subId]
-        ResourceType          = "Microsoft.Compute/virtualMachines"
-        ResourceId            = $vm.vmId
-        ResourceGroup         = $vm.resourceGroup
-        IsCompliant           = $false
-        ComplianceState       = $record.compliance_status
-        ScriptAssignmentName  = "audit_guardium_agent"
-        ScriptAssignmentId    = "audit_guardium_agent"
-        ScriptDefinitionName  = "audit_guardium_agent"
-        ScriptDefinitionId    = "audit_guardium_agent"
-        TenantId              = $record.tenantid
-        PolicyDefinitionRefId = "audit_guardium_agent"
+    $mgMap = @{}
+    foreach ($mg in $mgResults) {
+        $mgMap[$mg.subscriptionId] = $mg.managementGroupId
     }
-}
 
-# ================= EXPORT =================
-$csvPath = "C:\Temp\Guardium_Mortgage_NonCompliant_Report.csv"
-$finalResults | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
-Write-Host "Report generated successfully:"
-Write-Host $csvPath
+    # ==========================================================
+    # STEP 7: BUILD FINAL RESULTS
+    # ==========================================================
+
+    $finalResults = @()
+
+    foreach ($record in $tenantRecords) {
+
+        $vmName = $record.instance_name
+
+        if ([string]::IsNullOrWhiteSpace($vmName)) {
+            continue
+        }
+
+        if (-not $vmMap.ContainsKey($vmName)) {
+            Write-Host "VM not found in Azure: $vmName"
+            continue
+        }
+
+        $vm = $vmMap[$vmName]
+
+        $managementGroupId = if ($mgMap.ContainsKey($vm.subscriptionId)) {
+            $mgMap[$vm.subscriptionId]
+        }
+        else {
+            "NotFound"
+        }
+
+        $finalResults += [PSCustomObject]@{
+            VMName            = $vm.name
+            SubscriptionId    = $vm.subscriptionId
+            ResourceGroup     = $vm.resourceGroup
+            ManagementGroupId = $managementGroupId
+            ResourceId        = $vm.id
+            GuardiumStatus    = $record.guardium_agent
+            EIMId             = $record.eim_id
+            TenantId          = $TenantId
+        }
+    }
+
+    # ==========================================================
+    # STEP 8: WRITE DATA (HEADER ALREADY EXISTS)
+    # ==========================================================
+
+    if ($finalResults.Count -gt 0) {
+        $finalResults | Export-Csv -Path $outputFileFullPath -NoTypeInformation -Append
+        Write-Host "$($finalResults.Count) records written."
+    }
+    else {
+        Write-Host "No matching records. File contains header only."
+    }
+
+    Write-Host "Function completed successfully."
+}
+catch {
+    Write-Error "Unexpected error: $_"
+}
