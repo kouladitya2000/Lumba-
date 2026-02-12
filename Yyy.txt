@@ -1,55 +1,21 @@
-# ===============================
-# Load Private Root CA
-# ===============================
+$response = $null
 
-$caPath = Join-Path $PSScriptRoot "Certs\labbubu_root_SHA2.cer"
-
-if (-not (Test-Path $caPath)) {
-    throw "CA certificate not found at path: $caPath"
+try {
+    $response = $client.GetAsync($uri).GetAwaiter().GetResult()
+    Write-Host "Request completed."
+}
+catch {
+    Write-Host "GetAsync threw an exception:"
+    Write-Host $_.Exception.Message
+    throw
 }
 
-$caCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($caPath)
-
-# ===============================
-# Create Custom HttpClientHandler
-# ===============================
-
-$handler = [System.Net.Http.HttpClientHandler]::new()
-
-$handler.ServerCertificateCustomValidationCallback = {
-    param($request, $cert, $chain, $errors)
-
-    # Create new chain
-    $customChain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
-
-    # Use ONLY our custom root CA
-    $customChain.ChainPolicy.TrustMode =
-        [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
-
-    $customChain.ChainPolicy.CustomTrustStore.Add($caCert)
-
-    $customChain.ChainPolicy.RevocationMode =
-        [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
-
-    # Build chain
-    $isValid = $customChain.Build($cert)
-
-    return $isValid
+if ($null -eq $response) {
+    throw "Response is NULL after GetAsync."
 }
 
-# ===============================
-# Create HttpClient
-# ===============================
+Write-Host "Status Code: $($response.StatusCode)"
 
-$client = [System.Net.Http.HttpClient]::new($handler)
+$content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
 
-# ===============================
-# Make Request
-# ===============================
-
-$response = $client.GetAsync($uri).Result
-$response.EnsureSuccessStatusCode()
-
-$content = $response.Content.ReadAsStringAsync().Result
-
-Write-Output $content
+Write-Host "Content length: $($content.Length)"
