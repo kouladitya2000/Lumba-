@@ -1,162 +1,22 @@
-Write-Host "========== STARTING API CALL =========="
-
-# -------------------------------------------------
-# 1️⃣ FORCE TLS 1.2
-# -------------------------------------------------
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-Write-Host "TLS set to 1.2"
-
-# -------------------------------------------------
-# 2️⃣ DETECT OS + SET CERT PATH
-# -------------------------------------------------
-if ($IsLinux) {
-    $basePath = "/home/site/wwwroot/Certs"
-    Write-Host "Running on LINUX"
-}
-else {
-    $basePath = "C:\home\site\wwwroot\Certs"
-    Write-Host "Running on WINDOWS"
+if (-not $finalResults -or $finalResults.Count -eq 0) {
+    Write-Output "No compliant/non-compliant records to insert. Exiting..."
+    return
 }
 
-$rootCertPath = Join-Path $basePath "labubu_root_SHA2.cer"
-$intermediateCertPath = Join-Path $basePath "labubu_SHA2_inter.cer"
+Write-Output "Pushing $($finalResults.Count) records to SQL database..."
 
-Write-Host "Root Path: $rootCertPath"
-Write-Host "Intermediate Path: $intermediateCertPath"
+Add-ArrayToDbTblCompliance `
+    -DbServerName "<your-sql-server-name>" `
+    -DbName "<your-database-name>" `
+    -TableName "<your-table-name>" `
+    -DataArray $finalResults `
+    -DataCollectionTime $collectionTime `
+    -ScriptAssignmentName "audit_guardium_agent" `
+    -ScriptAssignmentId "audit_guardium_agent" `
+    -ScriptDefinitionName "audit_guardium_agent" `
+    -ScriptDefinitionId "audit_guardium_agent" `
+    -ScriptSetDefinitionName "audit_guardium_agent" `
+    -ScriptSetDefinitionId "audit_guardium_agent" `
+    -VersionInfo "1.0"
 
-# -------------------------------------------------
-# 3️⃣ VERIFY CERT FILES EXIST
-# -------------------------------------------------
-if (-not (Test-Path $rootCertPath)) {
-    throw "Root certificate file NOT found at $rootCertPath"
-}
-
-if (-not (Test-Path $intermediateCertPath)) {
-    throw "Intermediate certificate file NOT found at $intermediateCertPath"
-}
-
-Write-Host "Certificate files confirmed present"
-
-# -------------------------------------------------
-# 4️⃣ LOAD CERTIFICATES
-# -------------------------------------------------
-try {
-    $rootCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($rootCertPath)
-    $intermediateCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($intermediateCertPath)
-
-    Write-Host "Root Loaded: $($rootCert.Subject)"
-    Write-Host "Intermediate Loaded: $($intermediateCert.Subject)"
-}
-catch {
-    Write-Host "Certificate load FAILED"
-    Write-Host $_.Exception.Message
-    throw
-}
-
-# -------------------------------------------------
-# 5️⃣ DNS CHECK
-# -------------------------------------------------
-try {
-    $uriObject = [System.Uri]$uri
-    $hostname = $uriObject.Host
-    Write-Host "Resolving DNS for: $hostname"
-
-    [System.Net.Dns]::GetHostAddresses($hostname) | ForEach-Object {
-        Write-Host "Resolved IP: $($_.IPAddressToString)"
-    }
-}
-catch {
-    Write-Host "DNS resolution FAILED"
-    Write-Host $_.Exception.Message
-    throw
-}
-
-# -------------------------------------------------
-# 6️⃣ CREATE HTTP HANDLER WITH CUSTOM SSL VALIDATION
-# -------------------------------------------------
-$handler = New-Object System.Net.Http.HttpClientHandler
-
-$handler.ServerCertificateCustomValidationCallback = {
-    param($request, $cert, $chain, $errors)
-
-    Write-Host "----- SSL CALLBACK TRIGGERED -----"
-    Write-Host "System SSL Errors: $errors"
-
-    if (-not $cert) {
-        Write-Host "Server certificate is NULL"
-        return $false
-    }
-
-    Write-Host "Server Certificate Subject: $($cert.Subject)"
-    Write-Host "Server Certificate Issuer: $($cert.Issuer)"
-
-    $customChain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
-    $customChain.ChainPolicy.ExtraStore.Add($intermediateCert)
-    $customChain.ChainPolicy.ExtraStore.Add($rootCert)
-
-    $customChain.ChainPolicy.VerificationFlags = `
-        [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority
-
-    $customChain.ChainPolicy.RevocationMode = `
-        [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
-
-    $isValid = $customChain.Build($cert)
-
-    Write-Host "Custom chain build result: $isValid"
-
-    if (-not $isValid) {
-        foreach ($status in $customChain.ChainStatus) {
-            Write-Host "Chain Error: $($status.Status) - $($status.StatusInformation)"
-        }
-    }
-
-    return $isValid
-}
-
-# -------------------------------------------------
-# 7️⃣ CREATE HTTP CLIENT
-# -------------------------------------------------
-$client = New-Object System.Net.Http.HttpClient($handler)
-$client.Timeout = [TimeSpan]::FromSeconds(100)
-
-$client.DefaultRequestHeaders.Clear()
-$client.DefaultRequestHeaders.Add("Authorization", "Basic $encoded")
-$client.DefaultRequestHeaders.Add("Accept", "application/json")
-
-Write-Host "HTTP Client configured"
-
-# -------------------------------------------------
-# 8️⃣ EXECUTE REQUEST WITH FULL ERROR LOGGING
-# -------------------------------------------------
-try {
-    Write-Host "Calling API: $uri"
-
-    $httpResponse = $client.GetAsync($uri).GetAwaiter().GetResult()
-
-    Write-Host "HTTP Status Code: $($httpResponse.StatusCode)"
-
-    if (-not $httpResponse.IsSuccessStatusCode) {
-        throw "Request failed with status $($httpResponse.StatusCode)"
-    }
-
-    $content = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-
-    Write-Host "Response received successfully"
-    $response = $content | ConvertFrom-Json
-
-    Write-Host "JSON parsed successfully"
-}
-catch {
-    Write-Host "========== REQUEST FAILED =========="
-    Write-Host "Exception Type: $($_.Exception.GetType().FullName)"
-    Write-Host "Message: $($_.Exception.Message)"
-
-    if ($_.Exception.InnerException) {
-        Write-Host "Inner Exception Type: $($_.Exception.InnerException.GetType().FullName)"
-        Write-Host "Inner Exception Message: $($_.Exception.InnerException.Message)"
-    }
-
-    throw
-}
-
-Write-Host "========== END =========="
+Write-Output "Data successfully pushed to SQL."
