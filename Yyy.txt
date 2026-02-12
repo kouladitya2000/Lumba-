@@ -1,44 +1,31 @@
-# ===== Custom HttpClient for PowerShell 7 (Bypass Private CA) =====
+# Path to your private CA certificate
+$caPath = "/home/site/wwwroot/Certs/CA.cer"
 
-Add-Type @"
-using System.Net.Http;
-using System.Net.Security;
-using System.Security.Cryptography.X509Certificates;
+# Load the CA certificate
+$caCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($caPath)
 
-public class UnsafeHttpHandler : HttpClientHandler
-{
-    public UnsafeHttpHandler()
-    {
-        ServerCertificateCustomValidationCallback =
-            HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
-    }
-}
-"@
+# Create custom HttpClientHandler
+$handler = New-Object System.Net.Http.HttpClientHandler
 
-$handler = [UnsafeHttpHandler]::new()
-$client  = [System.Net.Http.HttpClient]::new($handler)
+$handler.ServerCertificateCustomValidationCallback = {
+    param($request, $cert, $chain, $errors)
 
-# Add headers
-$client.DefaultRequestHeaders.Clear()
-$client.DefaultRequestHeaders.Add("Authorization", "Basic $encoded")
-$client.DefaultRequestHeaders.Add("Accept", "application/json")
+    # Build a new chain using our custom CA
+    $customChain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+    $customChain.ChainPolicy.ExtraStore.Add($caCert)
+    $customChain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+    $customChain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority
 
-try {
-    Write-Host "Calling API: $uri"
+    $isValid = $customChain.Build($cert)
 
-    $httpResponse = $client.GetAsync($uri).GetAwaiter().GetResult()
-
-    if (-not $httpResponse.IsSuccessStatusCode) {
-        throw "Request failed: $($httpResponse.StatusCode)"
-    }
-
-    $content = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-    $response = $content | ConvertFrom-Json
-}
-catch {
-    Write-Host "API call failed"
-    Write-Host $_
-    throw
+    return $isValid
 }
 
-# ================================================================
+# Create HttpClient using custom handler
+$client = New-Object System.Net.Http.HttpClient($handler)
+
+# Make request
+$response = $client.GetAsync($uri).Result
+$content = $response.Content.ReadAsStringAsync().Result
+
+Write-Output $content
