@@ -1,21 +1,110 @@
-$response = $null
+Write-Host "Checking certificate paths..."
+
+if (!(Test-Path $rootPath)) {
+    throw "Root certificate not found at path: $rootPath"
+}
+
+if (!(Test-Path $intermediatePath)) {
+    throw "Intermediate certificate not found at path: $intermediatePath"
+}
+
+Write-Host "Certificates found. Loading..."
+
+$rootCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rootPath)
+$intermediateCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($intermediatePath)
+
+Write-Host "Root Cert Subject: $($rootCert.Subject)"
+Write-Host "Intermediate Cert Subject: $($intermediateCert.Subject)"
+
+# -------------------------------
+# HTTP Handler with Custom SSL Validation
+# -------------------------------
+
+$handler = [System.Net.Http.HttpClientHandler]::new()
+
+$handler.ServerCertificateCustomValidationCallback = {
+    param($request, $cert, $chain, $errors)
+
+    Write-Host "---- SSL Validation Callback Triggered ----"
+    Write-Host "Request URI: $($request.RequestUri)"
+    Write-Host "SslPolicyErrors: $errors"
+
+    if ($null -eq $cert) {
+        Write-Host "ERROR: Server certificate is null"
+        return $false
+    }
+
+    Write-Host "Server Certificate Subject: $($cert.Subject)"
+    Write-Host "Server Certificate Issuer: $($cert.Issuer)"
+
+    $customChain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+
+    $customChain.ChainPolicy.TrustMode =
+        [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+
+    # Add root certificate
+    $customChain.ChainPolicy.CustomTrustStore.Add($rootCert)
+
+    # Add intermediate certificate
+    $customChain.ChainPolicy.ExtraStore.Add($intermediateCert)
+
+    $customChain.ChainPolicy.RevocationMode =
+        [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+
+    $isValid = $customChain.Build($cert)
+
+    if ($isValid) {
+        Write-Host "Custom certificate chain validation SUCCESS."
+    }
+    else {
+        Write-Host "Custom certificate chain validation FAILED."
+        foreach ($status in $customChain.ChainStatus) {
+            Write-Host "Chain Error: $($status.Status)"
+            Write-Host "Description: $($status.StatusInformation)"
+        }
+    }
+
+    return $isValid
+}
+
+$client = [System.Net.Http.HttpClient]::new($handler)
+
+# -------------------------------
+# API Call
+# -------------------------------
 
 try {
+
+    Write-Host "Sending GET request to: $uri"
+
     $response = $client.GetAsync($uri).GetAwaiter().GetResult()
-    Write-Host "Request completed."
+
+    if ($null -eq $response) {
+        throw "HttpResponseMessage is null."
+    }
+
+    Write-Host "Response received. Status Code: $($response.StatusCode)"
+
+    $response.EnsureSuccessStatusCode()
+
+    Write-Host "Reading response content..."
+
+    $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+
+    Write-Host "Response content successfully read."
+
 }
 catch {
-    Write-Host "GetAsync threw an exception:"
-    Write-Host $_.Exception.Message
+    Write-Host "-------------------------------------"
+    Write-Host "API CALL FAILED"
+    Write-Host "Exception Type: $($_.Exception.GetType().FullName)"
+    Write-Host "Exception Message: $($_.Exception.Message)"
+
+    if ($_.Exception.InnerException) {
+        Write-Host "Inner Exception: $($_.Exception.InnerException.Message)"
+    }
+
+    Write-Host "-------------------------------------"
+
     throw
 }
-
-if ($null -eq $response) {
-    throw "Response is NULL after GetAsync."
-}
-
-Write-Host "Status Code: $($response.StatusCode)"
-
-$content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-
-Write-Host "Content length: $($content.Length)"
