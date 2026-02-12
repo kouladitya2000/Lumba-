@@ -1,186 +1,44 @@
-param($Timer)
+# ===== Custom HttpClient for PowerShell 7 (Bypass Private CA) =====
+
+Add-Type @"
+using System.Net.Http;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+
+public class UnsafeHttpHandler : HttpClientHandler
+{
+    public UnsafeHttpHandler()
+    {
+        ServerCertificateCustomValidationCallback =
+            HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+    }
+}
+"@
+
+$handler = [UnsafeHttpHandler]::new()
+$client  = [System.Net.Http.HttpClient]::new($handler)
+
+# Add headers
+$client.DefaultRequestHeaders.Clear()
+$client.DefaultRequestHeaders.Add("Authorization", "Basic $encoded")
+$client.DefaultRequestHeaders.Add("Accept", "application/json")
 
 try {
+    Write-Host "Calling API: $uri"
 
-    Write-Host "Function started."
+    $httpResponse = $client.GetAsync($uri).GetAwaiter().GetResult()
 
-    # ==========================================================
-    # CONFIGURATION
-    # ==========================================================
-
-    $TenantId = "<YOUR_TENANT_ID>"
-    $outputFileFullPath = "NonCompliantVMs_$TenantId.csv"
-
-    # ==========================================================
-    # ALWAYS CREATE FILE WITH HEADER
-    # ==========================================================
-
-    $header = "VMName,SubscriptionId,ResourceGroup,ManagementGroupId,ResourceId,GuardiumStatus,EIMId,TenantId"
-    $header | Out-File -FilePath $outputFileFullPath -Encoding utf8 -Force
-
-    # ==========================================================
-    # STEP 1: CALL API
-    # ==========================================================
-
-    try {
-
-        $apiHeaders = @{
-            "Content-Type"  = "application/json"
-            "Authorization" = "Bearer $AccessToken"
-        }
-
-        $response = Invoke-RestMethod -Uri $ApiUrl -Method Get -Headers $apiHeaders
-
-        if (-not $response) {
-            Write-Host "API returned empty response."
-            return
-        }
-
-    }
-    catch {
-        Write-Error "API call failed: $_"
-        return
+    if (-not $httpResponse.IsSuccessStatusCode) {
+        throw "Request failed: $($httpResponse.StatusCode)"
     }
 
-    # ==========================================================
-    # STEP 2: FILTER BY TENANT
-    # ==========================================================
-
-    $tenantRecords = $response | Where-Object {
-        ($_."project_name" -split "/")[0] -eq $TenantId
-    }
-
-    if (-not $tenantRecords) {
-        Write-Host "No records found for Tenant: $TenantId"
-        return
-    }
-
-    # ==========================================================
-    # STEP 3: EXTRACT VM NAMES
-    # ==========================================================
-
-    $vmNames = $tenantRecords |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_.instance_name) } |
-        Select-Object -ExpandProperty instance_name -Unique
-
-    if (-not $vmNames) {
-        Write-Host "No VM names found in API response."
-        return
-    }
-
-    # ==========================================================
-    # STEP 4: QUERY ONLY REQUIRED VMs FROM AZURE
-    # ==========================================================
-
-    $vmNameList = $vmNames | ForEach-Object { "'$_'" } -join ","
-
-    $vmQuery = @"
-Resources
-| where type =~ 'microsoft.compute/virtualmachines'
-| where name in ($vmNameList)
-| project name, resourceGroup, subscriptionId, id
-"@
-
-    try {
-        $vmResults = Search-AzGraph -Query $vmQuery
-    }
-    catch {
-        Write-Error "VM Resource Graph query failed: $_"
-        return
-    }
-
-    if (-not $vmResults) {
-        Write-Host "No matching Azure VMs found."
-        return
-    }
-
-    # ==========================================================
-    # STEP 5: CREATE VM LOOKUP MAP
-    # ==========================================================
-
-    $vmMap = @{}
-    foreach ($vm in $vmResults) {
-        $vmMap[$vm.name] = $vm
-    }
-
-    # ==========================================================
-    # STEP 6: MANAGEMENT GROUP QUERY + LOOKUP MAP
-    # ==========================================================
-
-    $mgQuery = @"
-ResourceContainers
-| where type =~ 'microsoft.resources/subscriptions'
-| project subscriptionId,
-          managementGroupId = properties.managementGroupAncestorsChain[-1].name
-"@
-
-    try {
-        $mgResults = Search-AzGraph -Query $mgQuery
-    }
-    catch {
-        Write-Error "Management Group query failed: $_"
-        return
-    }
-
-    $mgMap = @{}
-    foreach ($mg in $mgResults) {
-        $mgMap[$mg.subscriptionId] = $mg.managementGroupId
-    }
-
-    # ==========================================================
-    # STEP 7: BUILD FINAL RESULTS
-    # ==========================================================
-
-    $finalResults = @()
-
-    foreach ($record in $tenantRecords) {
-
-        $vmName = $record.instance_name
-
-        if ([string]::IsNullOrWhiteSpace($vmName)) {
-            continue
-        }
-
-        if (-not $vmMap.ContainsKey($vmName)) {
-            Write-Host "VM not found in Azure: $vmName"
-            continue
-        }
-
-        $vm = $vmMap[$vmName]
-
-        $managementGroupId = if ($mgMap.ContainsKey($vm.subscriptionId)) {
-            $mgMap[$vm.subscriptionId]
-        }
-        else {
-            "NotFound"
-        }
-
-        $finalResults += [PSCustomObject]@{
-            VMName            = $vm.name
-            SubscriptionId    = $vm.subscriptionId
-            ResourceGroup     = $vm.resourceGroup
-            ManagementGroupId = $managementGroupId
-            ResourceId        = $vm.id
-            GuardiumStatus    = $record.guardium_agent
-            EIMId             = $record.eim_id
-            TenantId          = $TenantId
-        }
-    }
-
-    # ==========================================================
-    # STEP 8: WRITE DATA (HEADER ALREADY EXISTS)
-    # ==========================================================
-
-    if ($finalResults.Count -gt 0) {
-        $finalResults | Export-Csv -Path $outputFileFullPath -NoTypeInformation -Append
-        Write-Host "$($finalResults.Count) records written."
-    }
-    else {
-        Write-Host "No matching records. File contains header only."
-    }
-
-    Write-Host "Function completed successfully."
+    $content = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    $response = $content | ConvertFrom-Json
 }
 catch {
-    Write-Error "Unexpected error: $_"
+    Write-Host "API call failed"
+    Write-Host $_
+    throw
 }
+
+# ================================================================
