@@ -1,111 +1,36 @@
-# =========================
-# LOAD CERTIFICATES
-# =========================
-Write-Host "Loading certificates..."
+# Load HSBC certificates
+$rootCertPath = "C:\home\site\wwwroot\Certs\labubu_root_SHA2.cer"
+$intermediateCertPath = "C:\home\site\wwwroot\Certs\labubu_SHA2_inter.cer"
 
-try {
-    $rootCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rootPath)
-    Write-Host "Root CA loaded: $($rootCert.Subject)"
-}
-catch {
-    Write-Error "FAILED to load Root CA certificate"
-    Write-Error $_
-    throw
-}
+$rootCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($rootCertPath)
+$intermediateCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($intermediateCertPath)
 
-try {
-    $intermediateCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($intermediatePath)
-    Write-Host "Intermediate CA loaded: $($intermediateCert.Subject)"
-}
-catch {
-    Write-Error "FAILED to load Intermediate CA certificate"
-    Write-Error $_
-    throw
-}
-
-# =========================
-# HTTP HANDLER WITH SSL LOGGING
-# =========================
-$handler = [System.Net.Http.HttpClientHandler]::new()
+# Create handler
+$handler = New-Object System.Net.Http.HttpClientHandler
 
 $handler.ServerCertificateCustomValidationCallback = {
     param($request, $cert, $chain, $errors)
 
-    Write-Host "`n--- SSL VALIDATION START ---"
-    Write-Host "Request URI      : $($request.RequestUri)"
-    Write-Host "Server Cert      : $($cert.Subject)"
-    Write-Host "Issuer           : $($cert.Issuer)"
-    Write-Host "SSL Policy Error : $errors"
+    Write-Host "Custom SSL validation started..."
 
-    $customChain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+    $customChain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
     $customChain.ChainPolicy.ExtraStore.Add($intermediateCert)
     $customChain.ChainPolicy.ExtraStore.Add($rootCert)
 
-    $customChain.ChainPolicy.VerificationFlags =
-        [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority
-
-    $customChain.ChainPolicy.RevocationMode =
-        [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+    $customChain.ChainPolicy.VerificationFlags = [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority
+    $customChain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
 
     $isValid = $customChain.Build($cert)
 
-    if (-not $isValid) {
-        Write-Error "❌ Certificate chain validation FAILED"
-        foreach ($status in $customChain.ChainStatus) {
-            Write-Error "Chain Status: $($status.Status) - $($status.StatusInformation)"
-        }
+    if ($isValid) {
+        Write-Host "SSL validation successful using HSBC CA"
+        return $true
     }
     else {
-        Write-Host "✅ Certificate chain validation SUCCESS"
+        Write-Host "SSL validation failed"
+        return $false
     }
-
-    Write-Host "--- SSL VALIDATION END ---`n"
-    return $isValid
 }
 
-# =========================
-# HTTP CLIENT
-# =========================
-$client = [System.Net.Http.HttpClient]::new($handler)
-
-$client.DefaultRequestHeaders.Clear()
-$client.DefaultRequestHeaders.Add("Authorization", "Basic $encoded")
-$client.DefaultRequestHeaders.Add("Accept", "application/json")
-
-# =========================
-# API CALL WITH LOGGING
-# =========================
-Write-Host "Calling API: $uri"
-
-try {
-    $httpResponse = $client.GetAsync($uri).GetAwaiter().GetResult()
-}
-catch {
-    Write-Error "❌ HTTP request failed BEFORE response"
-    Write-Error $_.Exception.Message
-    throw
-}
-
-Write-Host "HTTP Status Code: $($httpResponse.StatusCode)"
-
-if (-not $httpResponse.IsSuccessStatusCode) {
-    $errorBody = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-    Write-Error "❌ API returned failure"
-    Write-Error "Response Body:"
-    Write-Error $errorBody
-    throw "API call failed"
-}
-
-# =========================
-# RESPONSE PARSING
-# =========================
-try {
-    $content  = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-    $response = $content | ConvertFrom-Json
-    Write-Host "✅ API response parsed successfully"
-}
-catch {
-    Write-Error "❌ Failed to parse JSON response"
-    Write-Error $_
-    throw
-}
+$client = New-Object System.Net.Http.HttpClient($handler)
+$response = $client.GetAsync($uri).GetAwaiter().GetResult()
