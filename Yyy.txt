@@ -1,110 +1,111 @@
-Write-Host "Checking certificate paths..."
+# =========================
+# LOAD CERTIFICATES
+# =========================
+Write-Host "Loading certificates..."
 
-if (!(Test-Path $rootPath)) {
-    throw "Root certificate not found at path: $rootPath"
+try {
+    $rootCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rootPath)
+    Write-Host "Root CA loaded: $($rootCert.Subject)"
+}
+catch {
+    Write-Error "FAILED to load Root CA certificate"
+    Write-Error $_
+    throw
 }
 
-if (!(Test-Path $intermediatePath)) {
-    throw "Intermediate certificate not found at path: $intermediatePath"
+try {
+    $intermediateCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($intermediatePath)
+    Write-Host "Intermediate CA loaded: $($intermediateCert.Subject)"
+}
+catch {
+    Write-Error "FAILED to load Intermediate CA certificate"
+    Write-Error $_
+    throw
 }
 
-Write-Host "Certificates found. Loading..."
-
-$rootCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rootPath)
-$intermediateCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($intermediatePath)
-
-Write-Host "Root Cert Subject: $($rootCert.Subject)"
-Write-Host "Intermediate Cert Subject: $($intermediateCert.Subject)"
-
-# -------------------------------
-# HTTP Handler with Custom SSL Validation
-# -------------------------------
-
+# =========================
+# HTTP HANDLER WITH SSL LOGGING
+# =========================
 $handler = [System.Net.Http.HttpClientHandler]::new()
 
 $handler.ServerCertificateCustomValidationCallback = {
     param($request, $cert, $chain, $errors)
 
-    Write-Host "---- SSL Validation Callback Triggered ----"
-    Write-Host "Request URI: $($request.RequestUri)"
-    Write-Host "SslPolicyErrors: $errors"
-
-    if ($null -eq $cert) {
-        Write-Host "ERROR: Server certificate is null"
-        return $false
-    }
-
-    Write-Host "Server Certificate Subject: $($cert.Subject)"
-    Write-Host "Server Certificate Issuer: $($cert.Issuer)"
+    Write-Host "`n--- SSL VALIDATION START ---"
+    Write-Host "Request URI      : $($request.RequestUri)"
+    Write-Host "Server Cert      : $($cert.Subject)"
+    Write-Host "Issuer           : $($cert.Issuer)"
+    Write-Host "SSL Policy Error : $errors"
 
     $customChain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
-
-    $customChain.ChainPolicy.TrustMode =
-        [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
-
-    # Add root certificate
-    $customChain.ChainPolicy.CustomTrustStore.Add($rootCert)
-
-    # Add intermediate certificate
     $customChain.ChainPolicy.ExtraStore.Add($intermediateCert)
+    $customChain.ChainPolicy.ExtraStore.Add($rootCert)
+
+    $customChain.ChainPolicy.VerificationFlags =
+        [System.Security.Cryptography.X509Certificates.X509VerificationFlags]::AllowUnknownCertificateAuthority
 
     $customChain.ChainPolicy.RevocationMode =
         [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
 
     $isValid = $customChain.Build($cert)
 
-    if ($isValid) {
-        Write-Host "Custom certificate chain validation SUCCESS."
-    }
-    else {
-        Write-Host "Custom certificate chain validation FAILED."
+    if (-not $isValid) {
+        Write-Error "❌ Certificate chain validation FAILED"
         foreach ($status in $customChain.ChainStatus) {
-            Write-Host "Chain Error: $($status.Status)"
-            Write-Host "Description: $($status.StatusInformation)"
+            Write-Error "Chain Status: $($status.Status) - $($status.StatusInformation)"
         }
     }
+    else {
+        Write-Host "✅ Certificate chain validation SUCCESS"
+    }
 
+    Write-Host "--- SSL VALIDATION END ---`n"
     return $isValid
 }
 
+# =========================
+# HTTP CLIENT
+# =========================
 $client = [System.Net.Http.HttpClient]::new($handler)
 
-# -------------------------------
-# API Call
-# -------------------------------
+$client.DefaultRequestHeaders.Clear()
+$client.DefaultRequestHeaders.Add("Authorization", "Basic $encoded")
+$client.DefaultRequestHeaders.Add("Accept", "application/json")
+
+# =========================
+# API CALL WITH LOGGING
+# =========================
+Write-Host "Calling API: $uri"
 
 try {
-
-    Write-Host "Sending GET request to: $uri"
-
-    $response = $client.GetAsync($uri).GetAwaiter().GetResult()
-
-    if ($null -eq $response) {
-        throw "HttpResponseMessage is null."
-    }
-
-    Write-Host "Response received. Status Code: $($response.StatusCode)"
-
-    $response.EnsureSuccessStatusCode()
-
-    Write-Host "Reading response content..."
-
-    $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-
-    Write-Host "Response content successfully read."
-
+    $httpResponse = $client.GetAsync($uri).GetAwaiter().GetResult()
 }
 catch {
-    Write-Host "-------------------------------------"
-    Write-Host "API CALL FAILED"
-    Write-Host "Exception Type: $($_.Exception.GetType().FullName)"
-    Write-Host "Exception Message: $($_.Exception.Message)"
+    Write-Error "❌ HTTP request failed BEFORE response"
+    Write-Error $_.Exception.Message
+    throw
+}
 
-    if ($_.Exception.InnerException) {
-        Write-Host "Inner Exception: $($_.Exception.InnerException.Message)"
-    }
+Write-Host "HTTP Status Code: $($httpResponse.StatusCode)"
 
-    Write-Host "-------------------------------------"
+if (-not $httpResponse.IsSuccessStatusCode) {
+    $errorBody = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    Write-Error "❌ API returned failure"
+    Write-Error "Response Body:"
+    Write-Error $errorBody
+    throw "API call failed"
+}
 
+# =========================
+# RESPONSE PARSING
+# =========================
+try {
+    $content  = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    $response = $content | ConvertFrom-Json
+    Write-Host "✅ API response parsed successfully"
+}
+catch {
+    Write-Error "❌ Failed to parse JSON response"
+    Write-Error $_
     throw
 }
