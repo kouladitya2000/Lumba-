@@ -1,21 +1,25 @@
-$subscriptionId = "<subscription-id>"
-$resourceGroup  = "<resource-group>"
-$aseName        = "<ase-name>"
+$vaultName = "YOUR_KEYVAULT_NAME"
 
-az account set --subscription $subscriptionId
+$secrets = Get-AzKeyVaultSecret -VaultName $vaultName
 
-$apiVersion = "2022-09-01"
+$secretDetails = foreach ($secret in $secrets) {
+    
+    $fullSecret = Get-AzKeyVaultSecret -VaultName $vaultName -Name $secret.Name
 
-$resourceId = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName"
+    [PSCustomObject]@{
+        Name            = $fullSecret.Name
+        VaultName       = $vaultName
+        Version         = $fullSecret.Version
+        Enabled         = $fullSecret.Enabled
+        Created         = $fullSecret.Created
+        Updated         = $fullSecret.Updated
+        Expires         = $fullSecret.Expires
+        NotBefore       = $fullSecret.NotBefore
+        ContentType     = $fullSecret.ContentType
+        Tags            = ($fullSecret.Tags | Out-String)
+        SecretValue     = $fullSecret.SecretValueText
+        Id              = $fullSecret.Id
+    }
+}
 
-# Check current state
-az rest --method GET `
-  --uri "https://management.azure.com$resourceId?api-version=$apiVersion"
-
-# Enable zone redundancy
-az rest --method PATCH `
-  --uri "https://management.azure.com$resourceId?api-version=$apiVersion" `
-  --body "{ `"properties`": { `"zoneRedundancyEnabled`": true } }"
-
-Write-Host "Zone redundancy update submitted."
-Write-Host "Operation can take 12–24 hours."
+$secretDetails
