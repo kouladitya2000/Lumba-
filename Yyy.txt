@@ -1,25 +1,59 @@
-$subscriptionId = "<subscription-id>"
-$resourceGroup = "<resource-group>"
-$aseName = "stmg-nonprod-euw-mon-ase-01"
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$SubscriptionId,
+
+    [Parameter(Mandatory=$true)]
+    [string]$ResourceGroup,
+
+    [Parameter(Mandatory=$true)]
+    [string]$AseName
+)
+
+# ---------- LOGIN ----------
+Connect-AzAccount -ErrorAction Stop
+Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop
+
 $apiVersion = "2022-09-01"
 
-Connect-AzAccount
-Set-AzContext -SubscriptionId $subscriptionId
+$uri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Web/hostingEnvironments/$AseName?api-version=$apiVersion"
 
-$path = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName?api-version=$apiVersion"
+Write-Host "Fetching ASE..." -ForegroundColor Cyan
 
-# ===== GET =====
-$response = Invoke-AzRestMethod -Method GET -Path $path
-
+$response = Invoke-AzRestMethod -Method GET -Uri $uri -ErrorAction Stop
 $ase = $response.Content | ConvertFrom-Json
 
-# Confirm zones
-$ase.properties.maximumNumberOfZones
+# ---------- VALIDATIONS ----------
 
-# Enable zone redundancy
-$ase.properties.zoneRedundant = $true
+if ($ase.kind -notmatch "ASEV3") {
+    throw "This resource is NOT ASE v3. Detected kind: $($ase.kind)"
+}
 
-# ===== PUT =====
-Invoke-AzRestMethod -Method PUT -Path $path -Payload ($ase | ConvertTo-Json -Depth 25)
+if (-not $ase.properties.maximumNumberOfZones -or $ase.properties.maximumNumberOfZones -lt 2) {
+    throw "This region does not support Availability Zones for ASE."
+}
 
-Write-Host "Zone redundancy update triggered."
+Write-Host "ASE Version: $($ase.kind)"
+Write-Host "Region: $($ase.location)"
+Write-Host "Max Zones Supported: $($ase.properties.maximumNumberOfZones)"
+Write-Host "Current Zone Redundancy: $($ase.properties.zoneRedundancyEnabled)"
+
+# ---------- IDEMPOTENT CHECK ----------
+
+if ($ase.properties.zoneRedundancyEnabled -eq $true) {
+    Write-Host "Zone redundancy already enabled. Nothing to do." -ForegroundColor Green
+    return
+}
+
+Write-Host "Enabling Zone Redundancy..." -ForegroundColor Yellow
+
+# ---------- UPDATE ----------
+$ase.properties.zoneRedundancyEnabled = $true
+
+Invoke-AzRestMethod `
+    -Method PUT `
+    -Uri $uri `
+    -Payload ($ase | ConvertTo-Json -Depth 30) `
+    -ErrorAction Stop
+
+Write-Host "Zone redundancy update submitted successfully." -ForegroundColor Green
+Write-Host "Operation can take 12–24 hours to complete."
