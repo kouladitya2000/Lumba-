@@ -7,46 +7,44 @@ Set-AzContext -SubscriptionId $subscriptionId
 
 $apiVersion = "2022-09-01"
 
-$path = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName"
+# Get access token manually
+$token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
 
-# Get ASE
-$response = Invoke-AzRestMethod `
-    -Method GET `
-    -Path $path `
-    -ApiVersion $apiVersion
+$headers = @{
+    Authorization = "Bearer $token"
+    "Content-Type" = "application/json"
+}
 
-$ase = $response.Content | ConvertFrom-Json
+$uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName?api-version=$apiVersion"
 
-Write-Host "Kind:" $ase.kind
-Write-Host "Current ZoneRedundancyEnabled:" $ase.properties.zoneRedundancyEnabled
-Write-Host "Max Zones Supported:" $ase.properties.maximumNumberOfZones
+# ---------- GET ----------
+$response = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers
 
-# Validation
-if ($ase.kind -ne "ASEV3") {
+Write-Host "Kind:" $response.kind
+Write-Host "Current ZoneRedundancyEnabled:" $response.properties.zoneRedundancyEnabled
+Write-Host "Max Zones Supported:" $response.properties.maximumNumberOfZones
+
+if ($response.kind -ne "ASEV3") {
     throw "This is not ASE v3"
 }
 
-if ($ase.properties.maximumNumberOfZones -lt 2) {
+if ($response.properties.maximumNumberOfZones -lt 2) {
     throw "Region does not support availability zones"
 }
 
-if ($ase.properties.zoneRedundancyEnabled -eq $true) {
-    Write-Host "Already enabled. Nothing to do." -ForegroundColor Green
+if ($response.properties.zoneRedundancyEnabled -eq $true) {
+    Write-Host "Already enabled." -ForegroundColor Green
     return
 }
 
-# PATCH only the required property
+# ---------- PATCH ----------
 $body = @{
     properties = @{
         zoneRedundancyEnabled = $true
     }
 } | ConvertTo-Json -Depth 5
 
-Invoke-AzRestMethod `
-    -Method PATCH `
-    -Path $path `
-    -ApiVersion $apiVersion `
-    -Payload $body
+Invoke-RestMethod -Method PATCH -Uri $uri -Headers $headers -Body $body
 
 Write-Host "Zone redundancy update submitted successfully." -ForegroundColor Green
-Write-Host "This can take 12–24 hours."
+Write-Host "Operation can take 12–24 hours."
