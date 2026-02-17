@@ -2,49 +2,20 @@ $subscriptionId = "<subscription-id>"
 $resourceGroup  = "<resource-group>"
 $aseName        = "<ase-name>"
 
-Connect-AzAccount
-Set-AzContext -SubscriptionId $subscriptionId
+az account set --subscription $subscriptionId
 
 $apiVersion = "2022-09-01"
 
-# Get access token manually
-$token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
+$resourceId = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName"
 
-$headers = @{
-    Authorization = "Bearer $token"
-    "Content-Type" = "application/json"
-}
+# Check current state
+az rest --method GET `
+  --uri "https://management.azure.com$resourceId?api-version=$apiVersion"
 
-$uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName?api-version=$apiVersion"
+# Enable zone redundancy
+az rest --method PATCH `
+  --uri "https://management.azure.com$resourceId?api-version=$apiVersion" `
+  --body "{ `"properties`": { `"zoneRedundancyEnabled`": true } }"
 
-# ---------- GET ----------
-$response = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers
-
-Write-Host "Kind:" $response.kind
-Write-Host "Current ZoneRedundancyEnabled:" $response.properties.zoneRedundancyEnabled
-Write-Host "Max Zones Supported:" $response.properties.maximumNumberOfZones
-
-if ($response.kind -ne "ASEV3") {
-    throw "This is not ASE v3"
-}
-
-if ($response.properties.maximumNumberOfZones -lt 2) {
-    throw "Region does not support availability zones"
-}
-
-if ($response.properties.zoneRedundancyEnabled -eq $true) {
-    Write-Host "Already enabled." -ForegroundColor Green
-    return
-}
-
-# ---------- PATCH ----------
-$body = @{
-    properties = @{
-        zoneRedundancyEnabled = $true
-    }
-} | ConvertTo-Json -Depth 5
-
-Invoke-RestMethod -Method PATCH -Uri $uri -Headers $headers -Body $body
-
-Write-Host "Zone redundancy update submitted successfully." -ForegroundColor Green
+Write-Host "Zone redundancy update submitted."
 Write-Host "Operation can take 12–24 hours."
