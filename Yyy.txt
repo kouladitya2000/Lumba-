@@ -1,22 +1,26 @@
-if (-not $finalResults -or $finalResults.Count -eq 0) {
-    Write-Output "No compliant/non-compliant records to insert. Exiting..."
-    return
+$subscriptionId = "<subscription-id>"
+$resourceGroup = "<resource-group>"
+$aseName = "stmg-nonprod-euw-mon-ase-01"
+
+$apiVersion = "2023-12-01"
+
+# Get token
+$token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
+
+$uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName?api-version=$apiVersion"
+
+# Get current ASE config
+$current = Invoke-RestMethod -Method GET -Uri $uri -Headers @{
+    Authorization = "Bearer $token"
 }
 
-Write-Output "Pushing $($finalResults.Count) records to SQL database..."
+# Update zone redundancy
+$current.properties.zoneRedundant = $true
 
-Add-ArrayToDbTblCompliance `
-    -DbServerName "<your-sql-server-name>" `
-    -DbName "<your-database-name>" `
-    -TableName "<your-table-name>" `
-    -DataArray $finalResults `
-    -DataCollectionTime $collectionTime `
-    -ScriptAssignmentName "audit_guardium_agent" `
-    -ScriptAssignmentId "audit_guardium_agent" `
-    -ScriptDefinitionName "audit_guardium_agent" `
-    -ScriptDefinitionId "audit_guardium_agent" `
-    -ScriptSetDefinitionName "audit_guardium_agent" `
-    -ScriptSetDefinitionId "audit_guardium_agent" `
-    -VersionInfo "1.0"
+# Send PUT request
+$response = Invoke-RestMethod -Method PUT -Uri $uri -Headers @{
+    Authorization = "Bearer $token"
+    "Content-Type" = "application/json"
+} -Body ($current | ConvertTo-Json -Depth 20)
 
-Write-Output "Data successfully pushed to SQL."
+Write-Host "Zone redundancy update triggered."
