@@ -4,23 +4,33 @@ $aseName = "stmg-nonprod-euw-mon-ase-01"
 
 $apiVersion = "2023-12-01"
 
-# Get token
 $token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
 
 $uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName?api-version=$apiVersion"
 
-# Get current ASE config
-$current = Invoke-RestMethod -Method GET -Uri $uri -Headers @{
-    Authorization = "Bearer $token"
-}
+Write-Host "Calling URI:"
+Write-Host $uri
 
-# Update zone redundancy
+# GET current ASE
+$current = Invoke-RestMethod `
+    -Method GET `
+    -Uri $uri `
+    -Headers @{ Authorization = "Bearer $token" }
+
+# Verify property exists
+$current.properties | Format-List
+
+# Enable zone redundancy
 $current.properties.zoneRedundant = $true
 
-# Send PUT request
-$response = Invoke-RestMethod -Method PUT -Uri $uri -Headers @{
-    Authorization = "Bearer $token"
-    "Content-Type" = "application/json"
-} -Body ($current | ConvertTo-Json -Depth 20)
+# PUT update
+Invoke-RestMethod `
+    -Method PUT `
+    -Uri $uri `
+    -Headers @{
+        Authorization = "Bearer $token"
+        "Content-Type" = "application/json"
+    } `
+    -Body ($current | ConvertTo-Json -Depth 25)
 
-Write-Host "Zone redundancy update triggered."
+Write-Host "Zone redundancy update triggered successfully."
