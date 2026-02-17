@@ -1,26 +1,25 @@
 $subscriptionId = "<subscription-id>"
 $resourceGroup = "<resource-group>"
 $aseName = "stmg-nonprod-euw-mon-ase-01"
+$apiVersion = "2022-09-01"
 
 Connect-AzAccount
 Set-AzContext -SubscriptionId $subscriptionId
 
-$apiVersion = "2022-09-01"
+$path = "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName?api-version=$apiVersion"
 
-$uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName?api-version=$apiVersion"
-
-# GET
-$response = Invoke-AzRestMethod -Method GET -Uri $uri
+# ===== GET =====
+$response = Invoke-AzRestMethod -Method GET -Path $path
 
 $ase = $response.Content | ConvertFrom-Json
 
-# Safety check
+# Confirm zones
 $ase.properties.maximumNumberOfZones
 
 # Enable zone redundancy
 $ase.properties.zoneRedundant = $true
 
-# PUT update
-Invoke-AzRestMethod -Method PUT -Uri $uri -Payload ($ase | ConvertTo-Json -Depth 25)
+# ===== PUT =====
+Invoke-AzRestMethod -Method PUT -Path $path -Payload ($ase | ConvertTo-Json -Depth 25)
 
 Write-Host "Zone redundancy update triggered."
