@@ -1,36 +1,33 @@
+# ===== VARIABLES =====
 $subscriptionId = "<subscription-id>"
 $resourceGroup = "<resource-group>"
 $aseName = "stmg-nonprod-euw-mon-ase-01"
-
 $apiVersion = "2023-12-01"
 
-$token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
+# ===== LOGIN & CONTEXT =====
+Connect-AzAccount
+Set-AzContext -SubscriptionId $subscriptionId
 
-$uri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName?api-version=$apiVersion"
-
-Write-Host "Calling URI:"
-Write-Host $uri
-
-# GET current ASE
-$current = Invoke-RestMethod `
+# ===== GET CURRENT ASE =====
+$getResponse = Invoke-AzRestMethod `
     -Method GET `
-    -Uri $uri `
-    -Headers @{ Authorization = "Bearer $token" }
+    -Path "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName?api-version=$apiVersion"
 
-# Verify property exists
-$current.properties | Format-List
+$ase = ($getResponse.Content | ConvertFrom-Json)
 
-# Enable zone redundancy
-$current.properties.zoneRedundant = $true
+# ===== SAFETY CHECK =====
+if ($ase.properties.maximumNumberOfZones -lt 2) {
+    Write-Host "Region/Subnet does not support availability zones. Cannot enable zone redundancy."
+    return
+}
 
-# PUT update
-Invoke-RestMethod `
+# ===== ENABLE ZONE REDUNDANCY =====
+$ase.properties.zoneRedundant = $true
+
+# ===== UPDATE ASE =====
+Invoke-AzRestMethod `
     -Method PUT `
-    -Uri $uri `
-    -Headers @{
-        Authorization = "Bearer $token"
-        "Content-Type" = "application/json"
-    } `
-    -Body ($current | ConvertTo-Json -Depth 25)
+    -Path "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/providers/Microsoft.Web/hostingEnvironments/$aseName?api-version=$apiVersion" `
+    -Payload ($ase | ConvertTo-Json -Depth 25)
 
 Write-Host "Zone redundancy update triggered successfully."
