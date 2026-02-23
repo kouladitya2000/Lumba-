@@ -8,20 +8,16 @@ function UpdateConfluencePage(
     try {
 
         # =====================================================
-        # Force TLS 1.2 (important for Azure Functions)
+        # Force TLS 1.2
         # =====================================================
-        [System.Net.ServicePointManager]::SecurityProtocol = `
+        [System.Net.ServicePointManager]::SecurityProtocol =
             [System.Net.SecurityProtocolType]::Tls12
 
         # =====================================================
-        # Create HTTP Client with SSL Bypass
+        # Create HTTP Client (with SSL bypass)
         # =====================================================
         $handler = New-Object System.Net.Http.HttpClientHandler
-        $handler.Credentials = New-Object System.Net.NetworkCredential($username, $apiToken)
-        $handler.PreAuthenticate = $true
-
-        # Clean SSL bypass (recommended way)
-        $handler.ServerCertificateCustomValidationCallback = `
+        $handler.ServerCertificateCustomValidationCallback =
             [System.Net.Http.HttpClientHandler]::DangerousAcceptAnyServerCertificateValidator
 
         $client = New-Object System.Net.Http.HttpClient($handler)
@@ -29,10 +25,36 @@ function UpdateConfluencePage(
         $client.DefaultRequestHeaders.Add("Accept", "application/json")
 
         # =====================================================
-        # STEP 1 – GET existing page (to fetch version)
+        # Explicit Basic Authentication Header
+        # =====================================================
+        $pair = "$username`:$apiToken"
+        $encoded = [Convert]::ToBase64String(
+            [System.Text.Encoding]::ASCII.GetBytes($pair)
+        )
+
+        $client.DefaultRequestHeaders.Authorization =
+            New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $encoded)
+
+        # =====================================================
+        # Identity Check (Who am I?)
+        # =====================================================
+        $whoUri = "$baseUrl/confluence/rest/api/user/current"
+        Write-Host "Checking authenticated user -> $whoUri"
+
+        $whoResponse = $client.GetAsync($whoUri).GetAwaiter().GetResult()
+        $whoContent = $whoResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+
+        Write-Host "Authenticated User Response:"
+        Write-Host $whoContent
+
+        if (-not $whoResponse.IsSuccessStatusCode) {
+            throw "Authentication failed: $($whoResponse.StatusCode) - $whoContent"
+        }
+
+        # =====================================================
+        # STEP 1 – GET existing page (fetch version + space)
         # =====================================================
         $getUri = "$baseUrl/confluence/rest/api/content/$pageId?expand=version,space"
-
         Write-Host "GET -> $getUri"
 
         $getResponse = $client.GetAsync($getUri).GetAwaiter().GetResult()
@@ -43,7 +65,11 @@ function UpdateConfluencePage(
         }
 
         $pageContent = $getResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
-        $newVersion  = $pageContent.version.number + 1
+
+        Write-Host "Page Type:" $pageContent.type
+        Write-Host "Old Version:" $pageContent.version.number
+
+        $newVersion = $pageContent.version.number + 1
 
         # =====================================================
         # STEP 2 – Build Update Payload
@@ -70,8 +96,8 @@ function UpdateConfluencePage(
         # STEP 3 – PUT updated content
         # =====================================================
         $putUri = "$baseUrl/confluence/rest/api/content/$pageId"
-
         Write-Host "PUT -> $putUri"
+        Write-Host "New Version:" $newVersion
 
         $contentObject = New-Object System.Net.Http.StringContent(
             $payload,
