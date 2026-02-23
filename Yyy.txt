@@ -5,49 +5,57 @@ function UpdateConfluencePage(
     $apiToken,
     $data
 ) {
-
     try {
 
-        # ===============================
-        # HTTP CLIENT WITH CREDENTIALS
-        # ===============================
+        # =====================================================
+        # Force TLS 1.2 (important for Azure Functions)
+        # =====================================================
+        [System.Net.ServicePointManager]::SecurityProtocol = `
+            [System.Net.SecurityProtocolType]::Tls12
+
+        # =====================================================
+        # Create HTTP Client with SSL Bypass
+        # =====================================================
         $handler = New-Object System.Net.Http.HttpClientHandler
         $handler.Credentials = New-Object System.Net.NetworkCredential($username, $apiToken)
         $handler.PreAuthenticate = $true
+
+        # Clean SSL bypass (recommended way)
+        $handler.ServerCertificateCustomValidationCallback = `
+            [System.Net.Http.HttpClientHandler]::DangerousAcceptAnyServerCertificateValidator
 
         $client = New-Object System.Net.Http.HttpClient($handler)
         $client.DefaultRequestHeaders.Clear()
         $client.DefaultRequestHeaders.Add("Accept", "application/json")
 
-        # ===============================
-        # 1️⃣ GET EXISTING PAGE
-        # ===============================
+        # =====================================================
+        # STEP 1 – GET existing page (to fetch version)
+        # =====================================================
         $getUri = "$baseUrl/confluence/rest/api/content/$pageId?expand=version,space"
 
-        Write-Host "Calling GET: $getUri"
+        Write-Host "GET -> $getUri"
 
         $getResponse = $client.GetAsync($getUri).GetAwaiter().GetResult()
 
         if (-not $getResponse.IsSuccessStatusCode) {
-            throw "GET failed: $($getResponse.StatusCode)"
+            $errorText = $getResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            throw "GET failed: $($getResponse.StatusCode) - $errorText"
         }
 
-        $getContent = $getResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-        $response   = $getContent | ConvertFrom-Json
+        $pageContent = $getResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
+        $newVersion  = $pageContent.version.number + 1
 
-        $newVersion = $response.version.number + 1
-
-        # ===============================
-        # 2️⃣ PREPARE UPDATE BODY
-        # ===============================
+        # =====================================================
+        # STEP 2 – Build Update Payload
+        # =====================================================
         $payload = @{
             id    = $pageId
             type  = "page"
-            title = $response.title
+            title = $pageContent.title
             space = @{
-                key = $response.space.key
+                key = $pageContent.space.key
             }
-            body  = @{
+            body = @{
                 storage = @{
                     value          = GetHtmlTable($data)
                     representation = "storage"
@@ -58,23 +66,27 @@ function UpdateConfluencePage(
             }
         } | ConvertTo-Json -Depth 10
 
-        # ===============================
-        # 3️⃣ PUT UPDATED PAGE
-        # ===============================
+        # =====================================================
+        # STEP 3 – PUT updated content
+        # =====================================================
         $putUri = "$baseUrl/confluence/rest/api/content/$pageId"
 
-        Write-Host "Calling PUT: $putUri"
+        Write-Host "PUT -> $putUri"
 
-        $contentObj = New-Object System.Net.Http.StringContent($payload, [System.Text.Encoding]::UTF8, "application/json")
+        $contentObject = New-Object System.Net.Http.StringContent(
+            $payload,
+            [System.Text.Encoding]::UTF8,
+            "application/json"
+        )
 
-        $putResponse = $client.PutAsync($putUri, $contentObj).GetAwaiter().GetResult()
+        $putResponse = $client.PutAsync($putUri, $contentObject).GetAwaiter().GetResult()
 
         if (-not $putResponse.IsSuccessStatusCode) {
-            $errorContent = $putResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-            throw "PUT failed: $($putResponse.StatusCode) - $errorContent"
+            $errorText = $putResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            throw "PUT failed: $($putResponse.StatusCode) - $errorText"
         }
 
-        Write-Host "Page updated successfully."
+        Write-Host "Confluence page updated successfully."
 
     }
     catch {
