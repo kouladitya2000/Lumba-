@@ -1,303 +1,83 @@
-Below is a production-ready Confluence page written in clean structure, professional tone, and proper documentation format.
-You can paste this directly into Confluence.
-
-⸻
-
-Guardium Agent Compliance Monitoring – Azure IaaS VMs
-
-1. Document Information
-
-Field	Value
-Document Name	Guardium Agent Compliance Monitoring – Azure
-Solution Type	Azure Function (Timer Trigger)
-Owner	Cloud Compliance Team
-Environment	Production
-Last Updated	<Insert Date>
-
-
-⸻
-
-2. Purpose
-
-This document describes the design and implementation of the automated compliance monitoring solution used to detect Azure IaaS Virtual Machines where the Guardium Agent is not installed.
-
-The solution retrieves inventory data from CODS API, validates Azure resources, enriches with Management Group details, and stores non-compliant records in the central SQL reporting database.
-
-⸻
-
-3. Business Objective
-
-To automatically identify and report:
-	•	Azure IaaS VMs where guardium_agent is:
-	•	"notinstalled"
-	•	NULL
-	•	Blank / Empty
-
-And persist non-compliant records into the Compliance Reporting Database for visibility and governance tracking.
-
-⸻
-
-4. High-Level Architecture
-
-Execution Flow
-	1.	Azure Function Timer Trigger starts execution
-	2.	Fetch IaaS inventory from CODS API
-	3.	Filter records for target tenant
-	4.	Identify non-compliant VMs
-	5.	Validate VM existence in Azure
-	6.	Enrich with Management Group details
-	7.	Push compliance records to SQL database
-
-⸻
-
-5. Technical Architecture
-
-5.1 Components
-
-Component	Purpose
-Azure Function (Timer Trigger)	Orchestrates the compliance workflow
-CODS API	Provides IaaS inventory data
-Azure Resource Graph	Validates VM existence and retrieves metadata
-Azure Resource Containers	Retrieves Management Group hierarchy
-Azure SQL Database	Stores compliance results
-Managed Identity	Secure SQL authentication
-Service Principal	Azure authentication for Resource Graph
-
-
-⸻
-
-6. Detailed Processing Logic
-
-⸻
-
-6.1 Step 1 – Fetch IaaS Inventory (CODS API)
-
-The function:
-	•	Builds API URI
-	•	Uses Basic Authentication (Base64 encoded credentials)
-	•	Sends HTTP GET request
-	•	Converts JSON response
-
-Query Parameters:
-	•	page=1
-	•	size=50
-	•	csp_name=azure
-
-If API call fails:
-	•	Error logged
-	•	Exception thrown
-	•	Execution stops
-
-⸻
-
-6.2 Step 2 – Tenant Filtering
-
-Only records matching the configured tenant are processed.
-
-Filter condition:
-	•	project_name must not be null/empty
-	•	project_name must match configured Tenant ID
-
-This ensures single-tenant isolation.
-
-⸻
-
-6.3 Step 3 – Non-Compliant VM Identification
-
-A VM is marked non-compliant if:
-	•	guardium_agent is null
-	•	guardium_agent is empty
-	•	guardium_agent equals "notinstalled"
-
-These records are added to the non-compliant list for further processing.
-
-If no records found:
-	•	Function logs message
-	•	Execution exits gracefully
-
-⸻
-
-6.4 Step 4 – Extract Unique VM Names
-
-Unique instance_name values are extracted.
-
-If no valid instance names exist:
-	•	Function exits
-
-⸻
-
-6.5 Step 5 – Azure Validation (Resource Graph)
-
-The function queries Azure Resource Graph to:
-	•	Confirm VM exists in Azure
-	•	Retrieve:
-	•	Resource ID
-	•	Subscription ID
-	•	Resource Type
-	•	Tenant ID
-
-If VM is returned by API but not found in Azure:
-	•	Warning is logged
-	•	Record skipped
-
-This prevents stale or orphaned data from being reported.
-
-⸻
-
-6.6 Step 6 – Management Group Enrichment
-
-The function queries:
-	•	ResourceContainers (subscriptions)
-	•	Retrieves managementGroupAncestorsChain
-
-From the chain:
-	•	Top-level Management Group is extracted
-	•	Subscription-to-MG mapping is created
-
-This enriches compliance records with governance hierarchy.
-
-⸻
-
-6.7 Step 7 – Build Compliance Object
-
-For each validated VM, a structured compliance object is created with:
-
-Field	Description
-CollectionTimeStamp	Logical collection window
-Timestamp	Execution timestamp
-SubscriptionId	Azure Subscription ID
-ManagementGroupIds	Derived Management Group
-ResourceType	VM resource type
-ResourceId	Full Azure Resource ID
-IsCompliant	false
-ComplianceState	NonCompliant
-ScriptAssignmentName	audit_guardium_agent
-ScriptDefinitionName	audit_guardium_agent
-TenantId	Tenant from API
-
-All records are marked:
-	•	IsCompliant = false
-	•	ComplianceState = "NonCompliant"
-
-⸻
-
-6.8 Step 8 – SQL Database Insertion
-
-Authentication:
-	•	Uses Managed Identity
-
-Data is inserted into:
-
-Property	Value
-SQL Server	labubu-multi-compliance-prod-01-euw-sql-01
-Database	labubu-multi-compliance-prod-01-euw-sql-db-reporting-01
-Table	AutomationStatus
-
-Before insertion:
-	•	Record count validated
-	•	Empty dataset exits safely
-
-On success:
-	•	Logs number of records inserted
-	•	Logs success confirmation
-
-⸻
-
-7. Authentication & Security Model
-
-7.1 Azure Authentication
-	•	Service Principal used for Azure Resource Graph access
-	•	Tenant ID and Application ID stored in environment variables
-
-7.2 SQL Authentication
-	•	Managed Identity used
-	•	No SQL passwords stored in code
-
-7.3 Secrets Handling
-	•	API credentials stored as environment variables
-	•	No credentials hardcoded
-	•	Recommended: Move secrets to Azure Key Vault (if not already implemented)
-
-⸻
-
-8. Logging & Observability
-
-The function logs:
-	•	Execution start timestamp
-	•	Collection time window
-	•	API URI invoked
-	•	API failure details
-	•	Non-compliant record count
-	•	Missing VM warnings
-	•	SQL insertion count
-	•	Successful completion
-	•	Exception stack traces
-
-Recommended Enhancements:
-	•	Structured logging (JSON format)
-	•	Application Insights integration
-	•	Alerting on high non-compliance count
-
-⸻
-
-9. Error Handling Strategy
-
-Scenario	Handling
-API Failure	Log + Throw Exception
-Azure Login Failure	Log + Throw Exception
-Missing VM in Azure	Log Warning + Continue
-No Non-Compliant Records	Graceful Exit
-SQL Failure	Log + Throw Exception
-
-The solution ensures no partial or inconsistent data is inserted.
-
-⸻
-
-10. Assumptions
-	•	CODS inventory accurately reflects IaaS environment
-	•	VM names match Azure VM resource names
-	•	Subscription mapping exists in Resource Graph
-	•	SQL schema aligns with compliance object structure
-
-⸻
-
-11. Limitations
-	•	Pagination currently fixed (page size = 50)
-	•	No retry logic for transient API failures
-	•	Single-tenant processing per execution
-	•	No automatic alert notification (reporting only)
-
-⸻
-
-12. Future Enhancements
-	•	Implement API pagination loop
-	•	Add retry mechanism with exponential backoff
-	•	Integrate Azure Key Vault
-	•	Add email or Teams alert for non-compliant count threshold
-	•	Add dashboard in Log Analytics / Power BI
-	•	Enable parallel processing for large datasets
-
-⸻
-
-13. Summary
-
-This solution provides a fully automated compliance monitoring workflow that:
-
-✔ Detects Azure VMs without Guardium agent
-✔ Validates Azure resource existence
-✔ Enriches with governance hierarchy
-✔ Pushes structured compliance data to SQL
-✔ Maintains secure authentication model
-✔ Provides robust logging and error handling
-
-The process ensures only valid, existing Azure IaaS VMs without Guardium Agent are reported as NonCompliant, maintaining governance accuracy and operational reliability.
-
-⸻
-
-If you need, I can now provide:
-	•	An architecture diagram section formatted for Confluence draw.io
-	•	A one-page executive summary version
-	•	A Low-Level Design (LLD) appendix
-	•	Or a change management / release note section
-
-This version is final and documentation-ready.
+function UpdateConfluencePage($baseUrl, $pageId, $username, $apiToken, $data){
+
+    # Encode auth
+    $encoded = [Convert]::ToBase64String(
+        [Text.Encoding]::ASCII.GetBytes("$($username):$($apiToken)")
+    )
+
+    # --- SSL BYPASS HANDLER ---
+    Add-Type @"
+using System.Net.Http;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+
+public class UnsafeHttpHandler : HttpClientHandler
+{
+    public UnsafeHttpHandler()
+    {
+        ServerCertificateCustomValidationCallback =
+            HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+    }
+}
+"@
+
+    $handler = [UnsafeHttpHandler]::new()
+    $client = [System.Net.Http.HttpClient]::new($handler)
+
+    $client.DefaultRequestHeaders.Clear()
+    $client.DefaultRequestHeaders.Add("Authorization", "Basic $encoded")
+    $client.DefaultRequestHeaders.Add("Accept", "application/json")
+
+    # ==========================
+    # 1️⃣ GET EXISTING PAGE
+    # ==========================
+    $getUri = "$baseUrl/confluence/rest/api/content/$pageId"
+
+    Write-Host "Calling GET: $getUri"
+
+    $getResponse = $client.GetAsync($getUri).GetAwaiter().GetResult()
+
+    if (-not $getResponse.IsSuccessStatusCode) {
+        throw "GET failed: $($getResponse.StatusCode)"
+    }
+
+    $getContent = $getResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    $response = $getContent | ConvertFrom-Json
+
+    $version = $response.version.number + 1
+
+    # ==========================
+    # 2️⃣ PREPARE UPDATE BODY
+    # ==========================
+    $payload = @{
+        id = $pageId
+        type = "page"
+        title = $response.title
+        space = @{
+            key = $response.space.key
+        }
+        body = @{
+            storage = @{
+                value = GetHtmlTable($data)
+                representation = "storage"
+            }
+        }
+        version = @{
+            number = $version
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $putUri = "$baseUrl/confluence/rest/api/content/$pageId"
+
+    Write-Host "Calling PUT: $putUri"
+
+    $contentObj = New-Object System.Net.Http.StringContent($payload, [Text.Encoding]::UTF8, "application/json")
+
+    $putResponse = $client.PutAsync($putUri, $contentObj).GetAwaiter().GetResult()
+
+    if (-not $putResponse.IsSuccessStatusCode) {
+        throw "PUT failed: $($putResponse.StatusCode)"
+    }
+
+    Write-Host "Page updated successfully."
+}
