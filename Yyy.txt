@@ -1,127 +1,196 @@
-function UpdateConfluencePage(
-    $baseUrl,
-    $pageId,
-    $username,
-    $apiToken,
-    $data
-) {
-    try {
+Good. Then we’ll keep your original design:
 
-        # =====================================================
-        # Force TLS 1.2
-        # =====================================================
-        [System.Net.ServicePointManager]::SecurityProtocol =
-            [System.Net.SecurityProtocolType]::Tls12
+You want:
+	•	blob
+	•	queue
+	•	table
+	•	file
 
-        # =====================================================
-        # Create HTTP Client (with SSL bypass)
-        # =====================================================
-        $handler = New-Object System.Net.Http.HttpClientHandler
-        $handler.ServerCertificateCustomValidationCallback =
-            [System.Net.Http.HttpClientHandler]::DangerousAcceptAnyServerCertificateValidator
+All 4 services.
+No simplification. No reduction.
 
-        $client = New-Object System.Net.Http.HttpClient($handler)
-        $client.DefaultRequestHeaders.Clear()
-        $client.DefaultRequestHeaders.Add("Accept", "application/json")
+We’ll just fix it properly without changing your structure.
 
-        # =====================================================
-        # Explicit Basic Authentication Header
-        # =====================================================
-        $pair = "$username`:$apiToken"
-        $encoded = [Convert]::ToBase64String(
-            [System.Text.Encoding]::ASCII.GetBytes($pair)
-        )
+⸻
 
-        $client.DefaultRequestHeaders.Authorization =
-            New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Basic", $encoded)
+✅ FINAL — EXACTLY WHAT YOU NEED
 
-        # =====================================================
-        # Identity Check (Who am I?)
-        # =====================================================
-        $whoUri = "$baseUrl/confluence/rest/api/user/current"
-        Write-Host "Checking authenticated user -> $whoUri"
+⸻
 
-        $whoResponse = $client.GetAsync($whoUri).GetAwaiter().GetResult()
-        $whoContent = $whoResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+1️⃣ variables.tf
 
-        Write-Host "Authenticated User Response:"
-        Write-Host $whoContent
+Keep this:
 
-        if (-not $whoResponse.IsSuccessStatusCode) {
-            throw "Authentication failed: $($whoResponse.StatusCode) - $whoContent"
-        }
-
-        # =====================================================
-        # STEP 1 – GET existing page (fetch version + space)
-        # =====================================================
-        $getUri = "$baseUrl/confluence/rest/api/content/$pageId?expand=version,space"
-        Write-Host "GET -> $getUri"
-
-        $getResponse = $client.GetAsync($getUri).GetAwaiter().GetResult()
-
-        if (-not $getResponse.IsSuccessStatusCode) {
-            $errorText = $getResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-            throw "GET failed: $($getResponse.StatusCode) - $errorText"
-        }
-
-        $pageContent = $getResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
-
-        Write-Host "Page Type:" $pageContent.type
-        Write-Host "Old Version:" $pageContent.version.number
-
-        $newVersion = $pageContent.version.number + 1
-
-        # =====================================================
-        # STEP 2 – Build Update Payload
-        # =====================================================
-        $payload = @{
-            id    = $pageId
-            type  = "page"
-            title = $pageContent.title
-            space = @{
-                key = $pageContent.space.key
-            }
-            body = @{
-                storage = @{
-                    value          = GetHtmlTable($data)
-                    representation = "storage"
-                }
-            }
-            version = @{
-                number = $newVersion
-            }
-        } | ConvertTo-Json -Depth 10
-
-        # =====================================================
-        # STEP 3 – PUT updated content
-        # =====================================================
-        $putUri = "$baseUrl/confluence/rest/api/content/$pageId"
-        Write-Host "PUT -> $putUri"
-        Write-Host "New Version:" $newVersion
-
-        $contentObject = New-Object System.Net.Http.StringContent(
-            $payload,
-            [System.Text.Encoding]::UTF8,
-            "application/json"
-        )
-
-        $putResponse = $client.PutAsync($putUri, $contentObject).GetAwaiter().GetResult()
-
-        if (-not $putResponse.IsSuccessStatusCode) {
-            $errorText = $putResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-            throw "PUT failed: $($putResponse.StatusCode) - $errorText"
-        }
-
-        Write-Host "Confluence page updated successfully."
-
-    }
-    catch {
-        Write-Error "Error updating Confluence page: $_"
-        throw
-    }
-    finally {
-        if ($client) {
-            $client.Dispose()
-        }
-    }
+variable "storage_services" {
+  type = map(object({
+    name = string
+  }))
 }
+
+Nothing more. Nothing less.
+
+⸻
+
+2️⃣ terraform.tfvars
+
+Keep all 4 exactly like this:
+
+storage_services = {
+  blob = {
+    name = "blob"
+  }
+  queue = {
+    name = "queue"
+  }
+  table = {
+    name = "table"
+  }
+  file = {
+    name = "file"
+  }
+}
+
+No DNS IDs here.
+
+⸻
+
+3️⃣ data.tf
+
+You already have subnet data blocks.
+
+Add ONLY this:
+
+data "azurerm_virtual_network" "ase_vnet" {
+  name                = var.ase_vnet_name
+  resource_group_name = var.ase_vnet_rg
+}
+
+Add it at the bottom of the same file.
+
+Done.
+
+⸻
+
+4️⃣ Create NEW file → private-dns.tf
+
+Create file in same folder:
+
+private-dns.tf
+
+Paste FULL content below:
+
+resource "azurerm_private_dns_zone" "blob" {
+  name                = "privatelink.blob.core.windows.net"
+  resource_group_name = var.ase_vnet_rg
+}
+
+resource "azurerm_private_dns_zone" "queue" {
+  name                = "privatelink.queue.core.windows.net"
+  resource_group_name = var.ase_vnet_rg
+}
+
+resource "azurerm_private_dns_zone" "table" {
+  name                = "privatelink.table.core.windows.net"
+  resource_group_name = var.ase_vnet_rg
+}
+
+resource "azurerm_private_dns_zone" "file" {
+  name                = "privatelink.file.core.windows.net"
+  resource_group_name = var.ase_vnet_rg
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "blob_link" {
+  name                  = "blob-link"
+  resource_group_name   = var.ase_vnet_rg
+  private_dns_zone_name = azurerm_private_dns_zone.blob.name
+  virtual_network_id    = data.azurerm_virtual_network.ase_vnet.id
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "queue_link" {
+  name                  = "queue-link"
+  resource_group_name   = var.ase_vnet_rg
+  private_dns_zone_name = azurerm_private_dns_zone.queue.name
+  virtual_network_id    = data.azurerm_virtual_network.ase_vnet.id
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "table_link" {
+  name                  = "table-link"
+  resource_group_name   = var.ase_vnet_rg
+  private_dns_zone_name = azurerm_private_dns_zone.table.name
+  virtual_network_id    = data.azurerm_virtual_network.ase_vnet.id
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "file_link" {
+  name                  = "file-link"
+  resource_group_name   = var.ase_vnet_rg
+  private_dns_zone_name = azurerm_private_dns_zone.file.name
+  virtual_network_id    = data.azurerm_virtual_network.ase_vnet.id
+}
+
+Nothing else in this file.
+
+⸻
+
+5️⃣ storage.tf — FINAL FIX
+
+Inside your azurerm_private_endpoint block, modify ONLY the DNS part.
+
+Find this:
+
+private_dns_zone_ids = [each.value.private_dns_zone_id]
+
+DELETE that line completely.
+
+Replace your private_dns_zone_group block with this:
+
+private_dns_zone_group {
+  name = "default"
+
+  private_dns_zone_ids = [
+    lookup({
+      blob  = azurerm_private_dns_zone.blob.id
+      queue = azurerm_private_dns_zone.queue.id
+      table = azurerm_private_dns_zone.table.id
+      file  = azurerm_private_dns_zone.file.id
+    }, each.key)
+  ]
+}
+
+Do not change anything else.
+
+Keep your for_each.
+Keep your structure.
+Keep your naming.
+
+⸻
+
+📁 Final File Layout
+
+You will have:
+
+main.tf
+variables.tf
+terraform.tfvars
+storage.tf
+data.tf
+private-dns.tf
+
+That’s it.
+
+⸻
+
+🚀 Then Run
+
+terraform init
+terraform plan
+
+
+⸻
+
+This keeps your original architecture fully intact.
+No shortcuts.
+No removals.
+All 4 services.
+Enterprise compliant.
+
+If error comes, paste the full error block — not summary — and we fix that specific issue.
