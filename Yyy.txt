@@ -1,37 +1,143 @@
-param(
-    [string]$Environment,
-    [string]$ResourceGroupName,
-    [string]$ASEName
-)
+trigger: none
 
-Describe "App Service Environment Validation - $Environment" {
+parameters:
+- name: environment
+  type: string
+  default: nonprod
+  values:
+  - nonprod
+  - prod
 
-    BeforeAll {
-        Write-Host "Checking ASE in environment: $Environment"
-        Write-Host "Resource Group: $ResourceGroupName"
-        Write-Host "ASE Name: $ASEName"
+variables:
+  tfWorkingDir: '$(Build.SourcesDirectory)/terraform'
 
-        try {
-            $ase = az appservice ase show `
-                --name $ASEName `
-                --resource-group $ResourceGroupName `
-                --query "name" `
-                --output tsv 2>$null
-        }
-        catch {
-            $ase = $null
-        }
-    }
+############################################################
+# NON PROD PLAN
+############################################################
 
-    Context "ASE Existence Check" {
+- ${{ if eq(parameters.environment, 'nonprod') }}:
+  - stage: NonProd_Plan
+    displayName: "Non Prod - Terraform Plan"
+    jobs:
+    - job: Plan
+      displayName: "Terraform Plan (NonProd)"
+      pool:
+        name: hsbc-terraform-module-buildagents
 
-        It "ASE should exist in resource group $ResourceGroupName" {
+      steps:
+      - script: |
+          terraform init
+          terraform plan -out=tfplan
+        workingDirectory: $(tfWorkingDir)
 
-            $ase | Should -Not -BeNullOrEmpty
-            $ase | Should -Be $ASEName
+############################################################
+# NON PROD APPLY (Manual Approval)
+############################################################
 
-        }
+- ${{ if eq(parameters.environment, 'nonprod') }}:
+  - stage: NonProd_Apply
+    displayName: "Non Prod - Terraform Apply"
+    dependsOn: NonProd_Plan
+    condition: succeeded()
 
-    }
+    jobs:
+    - deployment: Apply
+      displayName: "Terraform Apply (NonProd)"
+      environment: NonProd-Approval   # <-- Configure manual approval in Azure DevOps UI
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - script: |
+                terraform apply -auto-approve tfplan
+              workingDirectory: $(tfWorkingDir)
 
-}
+############################################################
+# NON PROD PESTER TEST
+############################################################
+
+- ${{ if eq(parameters.environment, 'nonprod') }}:
+  - stage: RunAsePesterTest
+    displayName: "Non Prod - ASE Pester Test"
+    dependsOn: NonProd_Apply
+    condition: succeeded()
+
+    jobs:
+    - job: Pestertest
+      displayName: "Run ASE Pester Test"
+      pool:
+        name: hsbc-terraform-module-buildagents
+
+      steps:
+      - task: AzureCLI@2
+        displayName: "Run Pester Test for ASE"
+        inputs:
+          azureSubscription: "azsvc-hsbc-multi-cstmg-nonprod-automation-01"
+          scriptType: pscore
+          scriptLocation: inlineScript
+          inlineScript: |
+
+            $environment = "nonprod"
+            $resourceGroupName = "hsbc-$environment-platform-rg"
+            $aseName = "hsbc-$environment-ase"
+
+            $pesterContainer = New-PesterContainer `
+              -Path "$(Build.SourcesDirectory)/tests/pester-test-ase.ps1" `
+              -Data @{
+                  Environment = $environment
+                  ResourceGroupName = $resourceGroupName
+                  ASEName = $aseName
+              }
+
+            $results = Invoke-Pester -Container $pesterContainer -Output Detailed -PassThru
+
+            $results | Export-NUnitReport -Path "$(Build.SourcesDirectory)/tests/AseTest.xml"
+
+      - task: PublishTestResults@2
+        inputs:
+          testResultsFormat: NUnit
+          testResultsFiles: "**/AseTest.xml"
+          failTaskOnFailedTests: true
+          testRunTitle: "ASE Test"
+
+############################################################
+# PROD PLAN (Manual Approval Before Plan)
+############################################################
+
+- ${{ if eq(parameters.environment, 'prod') }}:
+  - stage: Prod_Plan
+    displayName: "Prod - Terraform Plan"
+    jobs:
+    - deployment: Plan
+      displayName: "Terraform Plan (Prod)"
+      environment: Prod-Plan-Approval  # <-- manual approval gate
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - script: |
+                terraform init
+                terraform plan -out=tfplan
+              workingDirectory: $(tfWorkingDir)
+
+############################################################
+# PROD APPLY (Manual Approval Again)
+############################################################
+
+- ${{ if eq(parameters.environment, 'prod') }}:
+  - stage: Prod_Apply
+    displayName: "Prod - Terraform Apply"
+    dependsOn: Prod_Plan
+    condition: succeeded()
+
+    jobs:
+    - deployment: Apply
+      displayName: "Terraform Apply (Prod)"
+      environment: Prod-Apply-Approval  # <-- manual approval gate
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - script: |
+                terraform apply -auto-approve tfplan
+              workingDirectory: $(tfWorkingDir)
