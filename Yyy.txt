@@ -1,1 +1,67 @@
+trigger: none
 
+parameters:
+- name: environment
+  type: string
+  default: nonprod
+
+stages:
+
+# =========================
+# PLAN STAGE
+# =========================
+- stage: Plan
+  displayName: "Terraform Plan Stage"
+
+  jobs:
+  - job: TerraformPlan
+    displayName: "Run Terraform Plan"
+    pool:
+      name: $(AGENT_POOL)
+
+    steps:
+    - checkout: self
+
+    - script: |
+        cd platform/ase
+
+        terraform init -backend-config=backend-${{ parameters.environment }}.hcl
+
+        terraform plan \
+          -var-file=${{ parameters.environment }}.tfvars \
+          -out=tfplan
+      displayName: "Terraform Plan"
+
+    - publish: platform/ase/tfplan
+      artifact: tfplan
+      displayName: "Publish Plan Artifact"
+
+
+# =========================
+# APPLY STAGE
+# =========================
+- stage: Apply
+  displayName: "Terraform Apply Stage"
+  dependsOn: Plan
+  condition: succeeded()
+
+  jobs:
+  - job: TerraformApply
+    displayName: "Run Terraform Apply"
+    pool:
+      name: $(AGENT_POOL)
+
+    steps:
+    - checkout: self
+
+    - download: current
+      artifact: tfplan
+      displayName: "Download Plan Artifact"
+
+    - script: |
+        cd platform/ase
+
+        terraform init -backend-config=backend-${{ parameters.environment }}.hcl
+
+        terraform apply -auto-approve tfplan
+      displayName: "Terraform Apply"
