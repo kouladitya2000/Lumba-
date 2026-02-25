@@ -1,21 +1,15 @@
 trigger: none
 
-parameters:
-- name: environment
-  type: string
-  default: nonprod
-
 stages:
 
-# =========================
-# PLAN STAGE
-# =========================
-- stage: Plan
-  displayName: "Terraform Plan Stage"
+# ==================================================
+# 1️⃣ NONPROD PLAN
+# ==================================================
+- stage: NonProd_Plan
+  displayName: "NonProd - Terraform Plan"
 
   jobs:
-  - job: TerraformPlan
-    displayName: "Run Terraform Plan"
+  - job: Plan
     pool:
       name: $(AGENT_POOL)
 
@@ -24,44 +18,121 @@ stages:
 
     - script: |
         cd platform/ase
-
-        terraform init -backend-config=backend-${{ parameters.environment }}.hcl
-
-        terraform plan \
-          -var-file=${{ parameters.environment }}.tfvars \
-          -out=tfplan
-      displayName: "Terraform Plan"
+        terraform init -backend-config=backend-nonprod.hcl
+        terraform plan -var-file=nonprod.tfvars -out=tfplan
+      displayName: "Terraform Plan (NonProd)"
 
     - publish: platform/ase/tfplan
-      artifact: tfplan
-      displayName: "Publish Plan Artifact"
+      artifact: nonprod_tfplan
 
 
-# =========================
-# APPLY STAGE
-# =========================
-- stage: Apply
-  displayName: "Terraform Apply Stage"
-  dependsOn: Plan
+# ==================================================
+# 2️⃣ NONPROD APPLY (MANUAL APPROVAL)
+# ==================================================
+- stage: NonProd_Apply
+  displayName: "NonProd - Terraform Apply"
+  dependsOn: NonProd_Plan
   condition: succeeded()
 
   jobs:
-  - job: TerraformApply
-    displayName: "Run Terraform Apply"
+  - deployment: Apply
+    environment: ase-nonprod   # Add approval in ADO
+    pool:
+      name: $(AGENT_POOL)
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - download: current
+            artifact: nonprod_tfplan
+
+          - script: |
+              cd platform/ase
+              terraform init -backend-config=backend-nonprod.hcl
+              terraform apply -auto-approve tfplan
+            displayName: "Terraform Apply (NonProd)"
+
+
+# ==================================================
+# 3️⃣ NONPROD PESTER
+# ==================================================
+- stage: NonProd_Pester
+  displayName: "NonProd - Pester Tests"
+  dependsOn: NonProd_Apply
+  condition: succeeded()
+
+  jobs:
+  - job: Pester
     pool:
       name: $(AGENT_POOL)
 
     steps:
     - checkout: self
 
-    - download: current
-      artifact: tfplan
-      displayName: "Download Plan Artifact"
-
     - script: |
-        cd platform/ase
+        cd tests
+        ./pester-test-ase.ps1 -Environment nonprod
+      displayName: "Run Pester (NonProd)"
 
-        terraform init -backend-config=backend-${{ parameters.environment }}.hcl
 
-        terraform apply -auto-approve tfplan
-      displayName: "Terraform Apply"
+# ==================================================
+# 4️⃣ PROD PLAN (MANUAL TRIGGER)
+# ==================================================
+- stage: Prod_Plan
+  displayName: "Prod - Terraform Plan"
+  dependsOn: NonProd_Pester
+  condition: succeeded()
+
+  jobs:
+  - deployment: PlanProd
+    environment: prod-plan-approval   # Add approval here
+    pool:
+      name: $(AGENT_POOL)
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - script: |
+              cd platform/ase
+              terraform init -backend-config=backend-prod.hcl
+              terraform plan -var-file=prod.tfvars -out=tfplan
+            displayName: "Terraform Plan (Prod)"
+
+          - publish: platform/ase/tfplan
+            artifact: prod_tfplan
+
+
+# ==================================================
+# 5️⃣ PROD APPLY (MANUAL APPROVAL)
+# ==================================================
+- stage: Prod_Apply
+  displayName: "Prod - Terraform Apply"
+  dependsOn: Prod_Plan
+  condition: succeeded()
+
+  jobs:
+  - deployment: ApplyProd
+    environment: ase-prod   # Add approval here
+    pool:
+      name: $(AGENT_POOL)
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - download: current
+            artifact: prod_tfplan
+
+          - script: |
+              cd platform/ase
+              terraform init -backend-config=backend-prod.hcl
+              terraform apply -auto-approve tfplan
+            displayName: "Terraform Apply (Prod)"
