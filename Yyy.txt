@@ -1,133 +1,28 @@
-trigger: none
-
-parameters:
-- name: environment
-  type: string
-  default: nonprod
-  values:
-  - nonprod
-  - prod
-
-variables:
-  tfWorkingDir: '$(Build.SourcesDirectory)/terraform'
-
-stages:
-
-# ==========================================================
-# NONPROD PLAN
-# ==========================================================
-- ${{ if eq(parameters.environment, 'nonprod') }}:
-  - stage: NonProd_Plan
-    displayName: "Non Prod - Terraform Plan"
-    jobs:
-    - job: Plan
-      displayName: "Terraform Plan (NonProd)"
-      pool:
-        name: hsbc-terraform-module-buildagents
-      steps:
-      - script: |
-          terraform init
-          terraform plan -out=tfplan
-        workingDirectory: $(tfWorkingDir)
-
-# ==========================================================
-# NONPROD APPLY
-# ==========================================================
-- ${{ if eq(parameters.environment, 'nonprod') }}:
-  - stage: NonProd_Apply
-    displayName: "Non Prod - Terraform Apply"
-    dependsOn: NonProd_Plan
-    condition: succeeded()
-    jobs:
-    - deployment: Apply
-      displayName: "Terraform Apply (NonProd)"
-      environment: NonProd-Approval
-      strategy:
-        runOnce:
-          deploy:
-            steps:
-            - script: |
-                terraform apply -auto-approve tfplan
-              workingDirectory: $(tfWorkingDir)
-
-# ==========================================================
-# NONPROD PESTER
-# ==========================================================
-- ${{ if eq(parameters.environment, 'nonprod') }}:
-  - stage: RunAsePesterTest
-    displayName: "Non Prod - ASE Pester Test"
-    dependsOn: NonProd_Apply
-    condition: succeeded()
-    jobs:
-    - job: Pestertest
-      displayName: "Run ASE Pester Test"
-      pool:
-        name: hsbc-terraform-module-buildagents
-      steps:
-      - task: AzureCLI@2
-        displayName: "Run Pester Test for ASE"
-        inputs:
-          azureSubscription: "azsvc-hsbc-multi-cstmg-nonprod-automation-01"
-          scriptType: pscore
-          scriptLocation: inlineScript
-          inlineScript: |
-            $environment = "nonprod"
-            $resourceGroupName = "hsbc-$environment-platform-rg"
-            $aseName = "hsbc-$environment-ase"
-
-            $pesterContainer = New-PesterContainer `
-              -Path "$(Build.SourcesDirectory)/tests/pester-test-ase.ps1" `
-              -Data @{
-                  Environment = $environment
-                  ResourceGroupName = $resourceGroupName
-                  ASEName = $aseName
-              }
-
-            $results = Invoke-Pester -Container $pesterContainer -Output Detailed -PassThru
-            $results | Export-NUnitReport -Path "$(Build.SourcesDirectory)/tests/AseTest.xml"
-
-      - task: PublishTestResults@2
-        inputs:
-          testResultsFormat: NUnit
-          testResultsFiles: "**/AseTest.xml"
-          failTaskOnFailedTests: true
-          testRunTitle: "ASE Test"
-
-# ==========================================================
-# PROD PLAN
-# ==========================================================
-- ${{ if eq(parameters.environment, 'prod') }}:
-  - stage: Prod_Plan
-    displayName: "Prod - Terraform Plan"
-    jobs:
-    - deployment: Plan
-      displayName: "Terraform Plan (Prod)"
-      environment: Prod-Plan-Approval
-      strategy:
-        runOnce:
-          deploy:
-            steps:
-            - script: |
-                terraform init
-                terraform plan -out=tfplan
-              workingDirectory: $(tfWorkingDir)
-
-# ==========================================================
-# PROD APPLY
-# ==========================================================
 - ${{ if eq(parameters.environment, 'prod') }}:
   - stage: Prod_Apply
     displayName: "Prod - Terraform Apply"
     dependsOn: Prod_Plan
     condition: succeeded()
     jobs:
-    - deployment: Apply
-      displayName: "Terraform Apply (Prod)"
-      environment: Prod-Apply-Approval
-      strategy:
-        runOnce:
-          deploy:
-            steps:
-            - script: |
-                terraform apply -auto-approve tfplan
-              workingDirectory: $(tfWorkingDir)
+
+    # 👇 Approval Job
+    - job: WaitForApproval
+      displayName: "Manual Approval - Prod Apply"
+      pool: server
+      steps:
+      - task: ManualValidation@0
+        inputs:
+          instructions: "Approve to continue with Prod Apply"
+          onTimeout: "reject"
+          timeoutInMinutes: 1440
+
+    # 👇 Actual Apply Job
+    - job: Apply
+      dependsOn: WaitForApproval
+      condition: succeeded()
+      pool:
+        name: hsbc-terraform-module-buildagents
+      steps:
+      - script: |
+          terraform apply -auto-approve tfplan
+        workingDirectory: $(tfWorkingDir)
