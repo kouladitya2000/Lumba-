@@ -1,196 +1,266 @@
-Good. Then we’ll keep your original design:
+Good. Let’s build this properly and cleanly.
 
-You want:
-	•	blob
-	•	queue
-	•	table
-	•	file
+You are deploying ASE + Resource Group only in this stack.
+No hardcoding.
+Environment-driven.
+Backend via .hcl.
+Ready to plug into pipeline.
 
-All 4 services.
-No simplification. No reduction.
-
-We’ll just fix it properly without changing your structure.
+Copy exactly as structured below.
 
 ⸻
 
-✅ FINAL — EXACTLY WHAT YOU NEED
+📁 FOLDER STRUCTURE
+
+platform/
+└── ase/
+    ├── main.tf
+    ├── variables.tf
+    ├── ase.tf
+    ├── nonprod.tfvars
+    ├── prod.tfvars
+    ├── backend-nonprod.hcl
+    └── backend-prod.hcl
+
+Go inside platform/ase and paste the following files.
 
 ⸻
 
-1️⃣ variables.tf
+1️⃣ main.tf
 
-Keep this:
-
-variable "storage_services" {
-  type = map(object({
-    name = string
-  }))
-}
-
-Nothing more. Nothing less.
-
-⸻
-
-2️⃣ terraform.tfvars
-
-Keep all 4 exactly like this:
-
-storage_services = {
-  blob = {
-    name = "blob"
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~>4.0"
+    }
   }
-  queue = {
-    name = "queue"
-  }
-  table = {
-    name = "table"
-  }
-  file = {
-    name = "file"
-  }
+
+  backend "azurerm" {}
 }
 
-No DNS IDs here.
+provider "azurerm" {
+  features {}
+}
+
+Nothing else here.
 
 ⸻
 
-3️⃣ data.tf
+2️⃣ variables.tf
 
-You already have subnet data blocks.
-
-Add ONLY this:
-
-data "azurerm_virtual_network" "ase_vnet" {
-  name                = var.ase_vnet_name
-  resource_group_name = var.ase_vnet_rg
+variable "location" {
+  type = string
 }
 
-Add it at the bottom of the same file.
+variable "resource_group_name" {
+  type = string
+}
 
-Done.
+variable "ase_name" {
+  type = string
+}
+
+variable "vnet_name" {
+  type = string
+}
+
+variable "vnet_rg" {
+  type = string
+}
+
+variable "subnet_name" {
+  type = string
+}
+
+variable "internal_load_balancing_mode" {
+  type    = string
+  default = "Web, Publishing"
+}
+
+variable "zone_redundant" {
+  type    = bool
+  default = false
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+
 
 ⸻
 
-4️⃣ Create NEW file → private-dns.tf
+3️⃣ ase.tf
 
-Create file in same folder:
-
-private-dns.tf
-
-Paste FULL content below:
-
-resource "azurerm_private_dns_zone" "blob" {
-  name                = "privatelink.blob.core.windows.net"
-  resource_group_name = var.ase_vnet_rg
+# Resource Group
+resource "azurerm_resource_group" "rg" {
+  name     = var.resource_group_name
+  location = var.location
+  tags     = var.tags
 }
 
-resource "azurerm_private_dns_zone" "queue" {
-  name                = "privatelink.queue.core.windows.net"
-  resource_group_name = var.ase_vnet_rg
+# Get existing VNet
+data "azurerm_virtual_network" "vnet" {
+  name                = var.vnet_name
+  resource_group_name = var.vnet_rg
 }
 
-resource "azurerm_private_dns_zone" "table" {
-  name                = "privatelink.table.core.windows.net"
-  resource_group_name = var.ase_vnet_rg
+# Get ASE subnet
+data "azurerm_subnet" "ase_subnet" {
+  name                 = var.subnet_name
+  virtual_network_name = var.vnet_name
+  resource_group_name  = var.vnet_rg
 }
 
-resource "azurerm_private_dns_zone" "file" {
-  name                = "privatelink.file.core.windows.net"
-  resource_group_name = var.ase_vnet_rg
+# App Service Environment v3
+resource "azurerm_app_service_environment_v3" "ase" {
+  name                         = var.ase_name
+  resource_group_name          = azurerm_resource_group.rg.name
+  location                     = var.location
+  subnet_id                    = data.azurerm_subnet.ase_subnet.id
+  internal_load_balancing_mode = var.internal_load_balancing_mode
+  zone_redundant               = var.zone_redundant
+
+  tags = var.tags
 }
 
-resource "azurerm_private_dns_zone_virtual_network_link" "blob_link" {
-  name                  = "blob-link"
-  resource_group_name   = var.ase_vnet_rg
-  private_dns_zone_name = azurerm_private_dns_zone.blob.name
-  virtual_network_id    = data.azurerm_virtual_network.ase_vnet.id
-}
-
-resource "azurerm_private_dns_zone_virtual_network_link" "queue_link" {
-  name                  = "queue-link"
-  resource_group_name   = var.ase_vnet_rg
-  private_dns_zone_name = azurerm_private_dns_zone.queue.name
-  virtual_network_id    = data.azurerm_virtual_network.ase_vnet.id
-}
-
-resource "azurerm_private_dns_zone_virtual_network_link" "table_link" {
-  name                  = "table-link"
-  resource_group_name   = var.ase_vnet_rg
-  private_dns_zone_name = azurerm_private_dns_zone.table.name
-  virtual_network_id    = data.azurerm_virtual_network.ase_vnet.id
-}
-
-resource "azurerm_private_dns_zone_virtual_network_link" "file_link" {
-  name                  = "file-link"
-  resource_group_name   = var.ase_vnet_rg
-  private_dns_zone_name = azurerm_private_dns_zone.file.name
-  virtual_network_id    = data.azurerm_virtual_network.ase_vnet.id
-}
-
-Nothing else in this file.
+Clean. Nothing hardcoded.
 
 ⸻
 
-5️⃣ storage.tf — FINAL FIX
+4️⃣ nonprod.tfvars
 
-Inside your azurerm_private_endpoint block, modify ONLY the DNS part.
+Replace values with yours.
 
-Find this:
+location            = "westeurope"
+resource_group_name = "hsbc-nonprod-platform-rg"
+ase_name            = "hsbc-nonprod-ase"
 
-private_dns_zone_ids = [each.value.private_dns_zone_id]
+vnet_name   = "shared-nonprod-vnet"
+vnet_rg     = "network-nonprod-rg"
+subnet_name = "ase-subnet"
 
-DELETE that line completely.
+internal_load_balancing_mode = "Web, Publishing"
+zone_redundant               = false
 
-Replace your private_dns_zone_group block with this:
-
-private_dns_zone_group {
-  name = "default"
-
-  private_dns_zone_ids = [
-    lookup({
-      blob  = azurerm_private_dns_zone.blob.id
-      queue = azurerm_private_dns_zone.queue.id
-      table = azurerm_private_dns_zone.table.id
-      file  = azurerm_private_dns_zone.file.id
-    }, each.key)
-  ]
+tags = {
+  environment = "nonprod"
+  owner       = "platform"
 }
 
-Do not change anything else.
-
-Keep your for_each.
-Keep your structure.
-Keep your naming.
 
 ⸻
 
-📁 Final File Layout
+5️⃣ prod.tfvars (example)
 
-You will have:
+location            = "westeurope"
+resource_group_name = "hsbc-prod-platform-rg"
+ase_name            = "hsbc-prod-ase"
 
-main.tf
-variables.tf
-terraform.tfvars
-storage.tf
-data.tf
-private-dns.tf
+vnet_name   = "shared-prod-vnet"
+vnet_rg     = "network-prod-rg"
+subnet_name = "ase-subnet"
+
+internal_load_balancing_mode = "Web, Publishing"
+zone_redundant               = true
+
+tags = {
+  environment = "prod"
+  owner       = "platform"
+}
+
+
+⸻
+
+6️⃣ backend-nonprod.hcl
+
+Replace with your state storage values.
+
+resource_group_name  = "tfstate-nonprod-rg"
+storage_account_name = "tfstatenonprod001"
+container_name       = "tfstate"
+key                  = "ase-nonprod.tfstate"
+
+
+⸻
+
+7️⃣ backend-prod.hcl
+
+resource_group_name  = "tfstate-prod-rg"
+storage_account_name = "tfstateprod001"
+container_name       = "tfstate"
+key                  = "ase-prod.tfstate"
+
+
+⸻
+
+🚀 HOW TO RUN LOCALLY
+
+Go to:
+
+cd platform/ase
+
+Then run:
+
+terraform init -backend-config=backend-nonprod.hcl
+terraform plan -var-file=nonprod.tfvars
+terraform apply -var-file=nonprod.tfvars
 
 That’s it.
 
 ⸻
 
-🚀 Then Run
+🚀 Minimal Azure DevOps Pipeline
 
-terraform init
-terraform plan
+Create: pipelines/ase-platform.yml
 
+trigger: none
+
+parameters:
+- name: environment
+  type: string
+  default: nonprod
+
+stages:
+- stage: Deploy_ASE
+  jobs:
+  - job: Terraform
+    pool:
+      name: $(AGENT_POOL)
+
+    steps:
+    - checkout: self
+
+    - script: |
+        cd platform/ase
+
+        terraform init -backend-config=backend-${{ parameters.environment }}.hcl
+        terraform plan -var-file=${{ parameters.environment }}.tfvars
+        terraform apply -auto-approve -var-file=${{ parameters.environment }}.tfvars
+
+Pipeline contains:
+	•	No infra values
+	•	No backend values
+	•	Only environment selector
+
+Exactly what you wanted.
 
 ⸻
 
-This keeps your original architecture fully intact.
-No shortcuts.
-No removals.
-All 4 services.
-Enterprise compliant.
+✅ What This Achieves
 
-If error comes, paste the full error block — not summary — and we fix that specific issue.
+✔ Resource Group created
+✔ ASE created
+✔ No hardcoding
+✔ Separate backend per environment
+✔ Clean platform layer
+✔ Ready for workload stack
+
+⸻
+
+Next step after you confirm this works:
+
+We build the Function App stack that consumes the ASE ID cleanly using terraform_remote_state.
+
+Run this first. If anything errors, paste exact error.
