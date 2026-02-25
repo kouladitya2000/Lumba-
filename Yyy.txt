@@ -1,28 +1,88 @@
-- ${{ if eq(parameters.environment, 'prod') }}:
-  - stage: Prod_Apply
-    displayName: "Prod - Terraform Apply"
-    dependsOn: Prod_Plan
-    condition: succeeded()
-    jobs:
+Perfect — you only need to replace the script steps with AzureCLI@2.
 
-    # 👇 Approval Job
-    - job: WaitForApproval
-      displayName: "Manual Approval - Prod Apply"
-      pool: server
-      steps:
-      - task: ManualValidation@0
-        inputs:
-          instructions: "Approve to continue with Prod Apply"
-          onTimeout: "reject"
-          timeoutInMinutes: 1440
+I’ll show you exactly where to change.
 
-    # 👇 Actual Apply Job
-    - job: Apply
-      dependsOn: WaitForApproval
-      condition: succeeded()
-      pool:
-        name: hsbc-terraform-module-buildagents
-      steps:
-      - script: |
-          terraform apply -auto-approve tfplan
-        workingDirectory: $(tfWorkingDir)
+⸻
+
+✅ Replace This In NonProd Plan
+
+Remove this:
+
+- script: |
+    terraform init -backend-config=backend-nonprod.hcl -input=false
+    terraform plan -var-file=nonprod.tfvars -out=tfplan
+  workingDirectory: $(tfWorkingDir)
+
+
+⸻
+
+🔁 Replace With This
+
+- task: AzureCLI@2
+  displayName: "Terraform Init & Plan (NonProd)"
+  inputs:
+    azureSubscription: "azsvc-hsbc-multi-cstmg-nonprod-automation-01"
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      cd $(tfWorkingDir)
+      terraform init -backend-config=backend-nonprod.hcl -input=false
+      terraform plan -var-file=nonprod.tfvars -out=tfplan
+
+
+⸻
+
+✅ Replace This In NonProd Apply
+
+Remove this:
+
+- script: |
+    terraform apply -auto-approve tfplan
+  workingDirectory: $(tfWorkingDir)
+
+
+⸻
+
+🔁 Replace With This
+
+- task: AzureCLI@2
+  displayName: "Terraform Apply (NonProd)"
+  inputs:
+    azureSubscription: "azsvc-hsbc-multi-cstmg-nonprod-automation-01"
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      cd $(tfWorkingDir)
+      terraform apply -auto-approve tfplan
+
+
+⸻
+
+🎯 That’s It
+
+You do NOT change:
+	•	variables
+	•	stages
+	•	approval job
+	•	pool
+	•	dependsOn
+
+You ONLY replace the script blocks with AzureCLI tasks.
+
+⸻
+
+🔎 Why This Fixes It
+
+AzureCLI@2:
+✔ Logs into Azure using your service connection
+✔ Sets correct subscription
+✔ Terraform can access backend
+
+Your previous script: step had no login context.
+
+⸻
+
+If you now run and still get auth error, next thing we check is:
+	•	Does service connection have correct subscription access?
+
+Run it once after replacing.
