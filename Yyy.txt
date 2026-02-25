@@ -1,88 +1,67 @@
-Perfect — you only need to replace the script steps with AzureCLI@2.
+variables:
+  tfWorkingDir: '$(Build.SourcesDirectory)/platform/ase'
+  AGENT_POOL: 'hsbc-multi-cstmg-01-aks-subscription-prod'
+  CopyFromCRNumber: 'CHG4941660'
+  KeyVaultName2: 'hsbcmulticstmg-es-pd-kv'
+  approvedCRNumber: ${{ parameters.approvedCRNumber }}
 
-I’ll show you exactly where to change.
+stages:
 
-⸻
+# ==========================================================
+# NONPROD PLAN
+# ==========================================================
+- ${{ if eq(parameters.environment, 'nonprod') }}:
+  - stage: NonProd_Plan
+    displayName: "Non Prod Terraform Plan"
+    jobs:
+      - job: Plan
+        displayName: "Terraform Plan (NonProd)"
+        pool:
+          name: $(AGENT_POOL)
+        steps:
+          - task: AzureCLI@2
+            displayName: "Terraform Init & Plan (NonProd)"
+            inputs:
+              azureSubscription: "azsvc-hsbc-multi-cstmg-nonprod-automation-01"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                cd $(tfWorkingDir)
+                terraform init -backend-config=backend-nonprod.hcl -input=false
+                terraform plan -var-file=nonprod.tfvars -out=tfplan
 
-✅ Replace This In NonProd Plan
+# ==========================================================
+# NONPROD APPLY
+# ==========================================================
+- ${{ if eq(parameters.environment, 'nonprod') }}:
+  - stage: NonProd_Apply
+    displayName: "Non Prod - Terraform Apply"
+    dependsOn: NonProd_Plan
+    condition: succeeded()
+    jobs:
 
-Remove this:
+      - job: WaitForApproval
+        displayName: "Manual Approval Non-Prod Apply"
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              instructions: "Approve to continue with Non Prod Apply"
+              onTimeout: "reject"
+              timeoutInMinutes: 1440
 
-- script: |
-    terraform init -backend-config=backend-nonprod.hcl -input=false
-    terraform plan -var-file=nonprod.tfvars -out=tfplan
-  workingDirectory: $(tfWorkingDir)
-
-
-⸻
-
-🔁 Replace With This
-
-- task: AzureCLI@2
-  displayName: "Terraform Init & Plan (NonProd)"
-  inputs:
-    azureSubscription: "azsvc-hsbc-multi-cstmg-nonprod-automation-01"
-    scriptType: bash
-    scriptLocation: inlineScript
-    inlineScript: |
-      cd $(tfWorkingDir)
-      terraform init -backend-config=backend-nonprod.hcl -input=false
-      terraform plan -var-file=nonprod.tfvars -out=tfplan
-
-
-⸻
-
-✅ Replace This In NonProd Apply
-
-Remove this:
-
-- script: |
-    terraform apply -auto-approve tfplan
-  workingDirectory: $(tfWorkingDir)
-
-
-⸻
-
-🔁 Replace With This
-
-- task: AzureCLI@2
-  displayName: "Terraform Apply (NonProd)"
-  inputs:
-    azureSubscription: "azsvc-hsbc-multi-cstmg-nonprod-automation-01"
-    scriptType: bash
-    scriptLocation: inlineScript
-    inlineScript: |
-      cd $(tfWorkingDir)
-      terraform apply -auto-approve tfplan
-
-
-⸻
-
-🎯 That’s It
-
-You do NOT change:
-	•	variables
-	•	stages
-	•	approval job
-	•	pool
-	•	dependsOn
-
-You ONLY replace the script blocks with AzureCLI tasks.
-
-⸻
-
-🔎 Why This Fixes It
-
-AzureCLI@2:
-✔ Logs into Azure using your service connection
-✔ Sets correct subscription
-✔ Terraform can access backend
-
-Your previous script: step had no login context.
-
-⸻
-
-If you now run and still get auth error, next thing we check is:
-	•	Does service connection have correct subscription access?
-
-Run it once after replacing.
+      - job: Apply
+        dependsOn: WaitForApproval
+        condition: succeeded()
+        pool:
+          name: $(AGENT_POOL)
+        steps:
+          - task: AzureCLI@2
+            displayName: "Terraform Apply (NonProd)"
+            inputs:
+              azureSubscription: "azsvc-hsbc-multi-cstmg-nonprod-automation-01"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                cd $(tfWorkingDir)
+                terraform apply -auto-approve tfplan
