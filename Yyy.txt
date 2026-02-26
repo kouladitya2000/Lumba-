@@ -1,67 +1,11 @@
-variables:
-  tfWorkingDir: '$(Build.SourcesDirectory)/platform/ase'
-  AGENT_POOL: 'hsbc-multi-cstmg-01-aks-subscription-prod'
-  CopyFromCRNumber: 'CHG4941660'
-  KeyVaultName2: 'hsbcmulticstmg-es-pd-kv'
-  approvedCRNumber: ${{ parameters.approvedCRNumber }}
-
-stages:
-
-# ==========================================================
-# NONPROD PLAN
-# ==========================================================
-- ${{ if eq(parameters.environment, 'nonprod') }}:
-  - stage: NonProd_Plan
-    displayName: "Non Prod Terraform Plan"
-    jobs:
-      - job: Plan
-        displayName: "Terraform Plan (NonProd)"
-        pool:
-          name: $(AGENT_POOL)
-        steps:
-          - task: AzureCLI@2
-            displayName: "Terraform Init & Plan (NonProd)"
-            inputs:
-              azureSubscription: "azsvc-hsbc-multi-cstmg-nonprod-automation-01"
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                cd $(tfWorkingDir)
-                terraform init -backend-config=backend-nonprod.hcl -input=false
-                terraform plan -var-file=nonprod.tfvars -out=tfplan
-
-# ==========================================================
-# NONPROD APPLY
-# ==========================================================
-- ${{ if eq(parameters.environment, 'nonprod') }}:
-  - stage: NonProd_Apply
-    displayName: "Non Prod - Terraform Apply"
-    dependsOn: NonProd_Plan
-    condition: succeeded()
-    jobs:
-
-      - job: WaitForApproval
-        displayName: "Manual Approval Non-Prod Apply"
-        pool: server
-        steps:
-          - task: ManualValidation@0
-            inputs:
-              instructions: "Approve to continue with Non Prod Apply"
-              onTimeout: "reject"
-              timeoutInMinutes: 1440
-
-      - job: Apply
-        dependsOn: WaitForApproval
-        condition: succeeded()
-        pool:
-          name: $(AGENT_POOL)
-        steps:
-          - task: AzureCLI@2
-            displayName: "Terraform Apply (NonProd)"
-            inputs:
-              azureSubscription: "azsvc-hsbc-multi-cstmg-nonprod-automation-01"
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                cd $(tfWorkingDir)
-                terraform apply -auto-approve tfplan
+foreach ($adGroup in $adGroups) {
+    if (
+        (
+            $adGroup.EndsWith("-vaultreader") -or
+            $adGroup.EndsWith("-reader")
+        ) -and
+        ($adGroup -notlike "*hsbc-spnkv-cloud-*")
+    ) {
+        $adGroupNames += $adGroup
+    }
+}
