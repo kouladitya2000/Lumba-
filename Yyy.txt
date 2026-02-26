@@ -1,11 +1,92 @@
-foreach ($adGroup in $adGroups) {
-    if (
-        (
-            $adGroup.EndsWith("-vaultreader") -or
-            $adGroup.EndsWith("-reader")
-        ) -and
-        ($adGroup -notlike "*hsbc-spnkv-cloud-*")
-    ) {
-        $adGroupNames += $adGroup
-    }
+Got it — this is the key point 👍
+You are no longer creating the ASE in the same Terraform run, but you still need the ASE ID so you can attach an App Service Plan (ASP) to an existing ASE v3.
+
+In that case, you cannot reference:
+
+azurerm_app_service_environment_v3.ase.id
+
+because that resource does not exist in this configuration anymore.
+
+⸻
+
+✅ Correct way: use a data source
+
+When a resource already exists, you must look it up, not create it.
+
+Use data "azurerm_app_service_environment_v3"
+
+data "azurerm_app_service_environment_v3" "existing_ase" {
+  name                = var.ase_name
+  resource_group_name = var.ase_rg_name
 }
+
+Now you can reference the ID safely:
+
+data.azurerm_app_service_environment_v3.existing_ase.id
+
+
+⸻
+
+How this plugs into your ASP
+
+Example App Service Plan using an existing ASE:
+
+resource "azurerm_app_service_plan" "asp" {
+  name                = var.asp_name
+  resource_group_name = var.asp_rg_name
+  location            = var.location
+
+  kind     = "App"
+  reserved = false
+  sku {
+    tier = "IsolatedV2"
+    size = "I1v2"
+  }
+
+  app_service_environment_id = data.azurerm_app_service_environment_v3.existing_ase.id
+}
+
+
+⸻
+
+Why this is the right approach
+
+Scenario	Correct Tool
+You create the ASE	resource
+ASE already exists	data
+Need its ID	data.<type>.<name>.id
+Avoids drift	✅
+No hardcoding	✅
+
+
+⸻
+
+❌ What NOT to do
+
+Don’t hardcode the ID
+
+app_service_environment_id = "/subscriptions/xxx/..."
+
+This breaks:
+	•	portability
+	•	environments
+	•	reusability
+
+⸻
+
+🧠 Mental model (important)
+
+Resources create things
+Data sources read things
+
+Once you split ASE and ASP lifecycles, this separation is mandatory.
+
+⸻
+
+If you want, I can:
+	•	Help you import the existing ASE into state instead
+	•	Validate provider version compatibility (ASE v3 is picky)
+	•	Show how to toggle between create vs lookup using a flag
+	•	Check if your ASE is v3 + IsolatedV2 compatible
+
+Just tell me what direction you want to go.
