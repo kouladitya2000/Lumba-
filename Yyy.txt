@@ -1,1 +1,2 @@
-
+terraform init \
+-backend-config="${{ parameters.environment }}/backend.hcl"
