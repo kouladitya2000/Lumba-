@@ -1,2 +1,29 @@
-terraform init \
--backend-config="${{ parameters.environment }}/backend.hcl"
+function Get-TenantInfoFromHeaderComments {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $tenants = @()
+
+    foreach ($line in Get-Content -LiteralPath $Path -ErrorAction Stop) {
+
+        # Stop reading once main block comment starts
+        if ($line -match '^\s*<#') { break }
+
+        # Match lines like:
+        # HSBC Mortgages,Mortgages,e352209c-2734-4a03-a6ba-d4ee6f2ed11e
+        if ($line -match '^\s*#\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([0-9a-fA-F\-]{36})') {
+
+            $tenants += [PSCustomObject]@{
+                ActualName   = $matches[1].Trim()
+                FriendlyName = $matches[2].Trim()
+                TenantId     = $matches[3].Trim()
+            }
+
+        }
+    }
+
+    return $tenants
+}
