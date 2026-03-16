@@ -1,44 +1,47 @@
-param($Timer)
+# Storage info
+$subscriptionId = "<subscription-id>"
+$storageAccountName = "<storage-account>"
+$containerName = "waf"
 
-$storageAccountName = "autopowershellfaeunnp01"
-$resourceGroupName  = "YOUR-RG"
-$containerName      = "waf"
+# Login context
+$ctx = (Get-AzStorageAccount -Name $storageAccountName).Context
 
-$ctx = (Get-AzStorageAccount -ResourceGroupName $resourceGroupName -Name $storageAccountName).Context
-
+# Get all tenant summary html files
 $summaryFiles = Get-AzStorageBlob -Container $containerName -Context $ctx |
-Where-Object { $_.Name -like "*_summary.html" }
+Where-Object { $_.Name -like "AppGwWaf_Compare_SummaryBySubscription_*.html" }
 
 $tenantNav = @()
 
 foreach ($file in $summaryFiles) {
 
-    $tenant = $file.Name -replace "_summary.html"
+    $tenant = $file.Name `
+        -replace "AppGwWaf_Compare_SummaryBySubscription_" `
+        -replace ".html"
 
     $tenantNav += [PSCustomObject]@{
         label       = $tenant
         tenantid    = $tenant
-        summary     = "$tenant`_summary.html"
-        summaryCSV  = "$tenant`_summary.csv"
-        detailsCSV  = "$tenant`_details.csv"
-        detailsHtml = "$tenant`_details.html"
+        summary     = "AppGwWaf_Compare_SummaryBySubscription_$tenant.html"
+        summaryCSV  = "AppGwWaf_Compare_SummaryBySubscription_$tenant.csv"
+        detailsHtml = "AppGwWaf_Compare_Details_$tenant.html"
+        detailsCSV  = "AppGwWaf_Compare_Details_$tenant.csv"
     }
 }
 
-$tenantJson = ($tenantNav | ConvertTo-Json -Compress -Depth 5)
+# Convert to JSON
+$tenantJson = $tenantNav | ConvertTo-Json -Depth 5 -Compress
 
-$outDir = $env:TEMP
-$indexPath = Join-Path $outDir "index.html"
-
+# Build index html
 $indexHtml = @"
 <html>
 <head>
 <meta charset='utf-8'>
 <title>AppGw WAF Compare - All Tenants</title>
 <style>
-body{font-family:Arial;font-size:12px}
+body{font-family:Arial,Helvetica,sans-serif;font-size:12px}
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
 button{padding:6px 10px}
+.mono{font-family:Consolas,Monaco,monospace}
 iframe{width:100%;height:82vh;border:1px solid #ccc}
 </style>
 </head>
@@ -48,55 +51,61 @@ iframe{width:100%;height:82vh;border:1px solid #ccc}
 <h2>All Tenants - Subscription Summary</h2>
 
 <div class="bar">
-<button id="prevBtn" onclick="prevTenant()">Previous</button>
-<button id="nextBtn" onclick="nextTenant()">Next</button>
+<button id='prevBtn' onclick='prevTenant()'>Previous</button>
+<button id='nextBtn' onclick='nextTenant()'>Next</button>
+<span id='pos'></span>
+<span class='mono' id='tenantLabel'></span>
 
-<span id="pos"></span>
-<span id="tenantLabel"></span>
-
-<a id="openSummary" href="#" target="_blank">Open summary</a>
-<a id="openDetailsHtml" href="#" target="_blank">Open details (HTML)</a>
-<a id="openSummaryCsv" href="#" target="_blank">Summary CSV</a>
-<a id="openDetailsCsv" href="#" target="_blank">Details CSV</a>
-
+<a id='openSummary' href='#' target='_blank' style='margin-left:10px'>Open summary</a>
+<a id='openDetailsHtml' href='#' target='_blank'>Open details (HTML)</a>
+<a id='openSummaryCsv' href='#' target='_blank'>Summary CSV</a>
+<a id='openDetailsCsv' href='#' target='_blank'>Details CSV</a>
 </div>
 
-<iframe id="frame" src="about:blank"></iframe>
+<iframe id='frame' src='about:blank'></iframe>
 
 <script>
 
-const tenants = $tenantJson
+const tenantsRaw = $tenantJson
+const tenants = Array.isArray(tenantsRaw) ? tenantsRaw : [tenantsRaw]
+
 let idx = 0
 
 function render(){
 
- if(!tenants || tenants.length===0){
-  document.getElementById('tenantLabel').innerText='No tenant outputs were generated'
-  return
- }
-
- if(idx<0) idx=0
- if(idx>=tenants.length) idx=tenants.length-1
-
- const t = tenants[idx]
-
- document.getElementById('tenantLabel').innerText = t.label
- document.getElementById('pos').innerText = (idx+1)+' of '+tenants.length
-
- document.getElementById('frame').src = t.summary
-
- document.getElementById('openSummary').href = t.summary
- document.getElementById('openDetailsHtml').href = t.detailsHtml
- document.getElementById('openSummaryCsv').href = t.summaryCSV
- document.getElementById('openDetailsCsv').href = t.detailsCSV
-
- document.getElementById('prevBtn').disabled = (idx===0)
- document.getElementById('nextBtn').disabled = (idx===tenants.length-1)
-
+if(!tenants || tenants.length === 0){
+document.getElementById('tenantLabel').innerText='No tenants found'
+return
 }
 
-function prevTenant(){ idx--; render(); }
-function nextTenant(){ idx++; render(); }
+if(idx < 0) idx = 0
+if(idx > tenants.length-1) idx = tenants.length-1
+
+const t = tenants[idx]
+
+document.getElementById('tenantLabel').innerText = t.label
+document.getElementById('pos').innerText = (idx+1) + " of " + tenants.length
+
+document.getElementById('frame').src = t.summary
+
+document.getElementById('openSummary').href = t.summary
+document.getElementById('openDetailsHtml').href = t.detailsHtml
+document.getElementById('openSummaryCsv').href = t.summaryCSV
+document.getElementById('openDetailsCsv').href = t.detailsCSV
+
+document.getElementById('prevBtn').disabled = idx === 0
+document.getElementById('nextBtn').disabled = idx === tenants.length-1
+}
+
+function prevTenant(){
+idx--
+render()
+}
+
+function nextTenant(){
+idx++
+render()
+}
 
 render()
 
@@ -106,11 +115,16 @@ render()
 </html>
 "@
 
-$indexHtml | Out-File $indexPath -Encoding utf8
+# Save locally
+$tmp = Join-Path $env:TEMP "index.html"
+[System.IO.File]::WriteAllText($tmp,$indexHtml)
 
+# Upload to storage
 Set-AzStorageBlobContent `
--File $indexPath `
--Container $containerName `
--Blob "index.html" `
--Context $ctx `
--Force
+    -Container $containerName `
+    -File $tmp `
+    -Blob "index.html" `
+    -Context $ctx `
+    -Force
+
+Write-Host "Index rebuilt successfully"
