@@ -1,1 +1,48 @@
+try {
+    Write-Host "Calling API: $uri"
 
+    $httpResponse = $client.GetAsync($uri).GetAwaiter().GetResult()
+
+    if (-not $httpResponse.IsSuccessStatusCode) {
+
+        # Read error response body (IMPORTANT)
+        $errorContent = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+
+        Write-Host "API FAILED"
+        Write-Host "StatusCode: $($httpResponse.StatusCode)"
+        Write-Host "Error Response: $errorContent"
+
+        # SEND EMAIL
+        Send-ErrorEmail `
+            -Subject "API Failure - StatusCode $($httpResponse.StatusCode)" `
+            -Body "URI: $uri `nStatusCode: $($httpResponse.StatusCode) `nResponse: $errorContent"
+
+        throw "Request failed: $($httpResponse.StatusCode)"
+    }
+
+    $content = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    $response = $content | ConvertFrom-Json
+
+    # Handle empty response ALSO
+    if (-not $response -or -not $response.result -or $response.result.Count -eq 0) {
+
+        Write-Host "API returned empty data"
+
+        Send-ErrorEmail `
+            -Subject "API Returned Empty Response" `
+            -Body "URI: $uri `nResponse was empty or null"
+
+        return
+    }
+}
+catch {
+    Write-Host "API call failed"
+    Write-Host $_
+
+    # SEND EMAIL (for unexpected failures like timeout, DNS, etc.)
+    Send-ErrorEmail `
+        -Subject "API Exception Occurred" `
+        -Body "URI: $uri `nError: $($_ | Out-String)"
+
+    throw
+}
