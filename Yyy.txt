@@ -3,46 +3,160 @@ try {
 
     $httpResponse = $client.GetAsync($uri).GetAwaiter().GetResult()
 
+    # ❌ API FAILURE → STOP execution
     if (-not $httpResponse.IsSuccessStatusCode) {
 
-        # Read error response body (IMPORTANT)
         $errorContent = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $statusCode = $httpResponse.StatusCode
+        $errorType = "API_FAILURE"
 
-        Write-Host "API FAILED"
-        Write-Host "StatusCode: $($httpResponse.StatusCode)"
-        Write-Host "Error Response: $errorContent"
+        try {
+            $parsed = $errorContent | ConvertFrom-Json
+            $errorContent = $parsed | ConvertTo-Json -Depth 5
+        } catch {}
 
-        # SEND EMAIL
-        Send-ErrorEmail `
-            -Subject "API Failure - StatusCode $($httpResponse.StatusCode)" `
-            -Body "URI: $uri `nStatusCode: $($httpResponse.StatusCode) `nResponse: $errorContent"
+        $emailBody = @"
+<html>
+<body>
+<h3>🚨 API Error Notification</h3>
 
-        throw "Request failed: $($httpResponse.StatusCode)"
+<p><b>Error Type:</b> $errorType</p>
+<p><b>Timestamp:</b> $(Get-Date)</p>
+
+<hr>
+
+<p><b>URI:</b> $uri</p>
+<p><b>Status Code:</b> $statusCode</p>
+
+<pre>$errorContent</pre>
+
+</body>
+</html>
+"@
+
+        foreach ($emailaddress in $EmailAddressCCChain.Split(",")) {
+            try {
+                $emailReqObject = @{
+                    to      = $emailaddress.Trim()
+                    subject = "API Failure - StatusCode $statusCode"
+                    body    = $emailBody
+                    isHtml  = $true
+                }
+
+                $emailReqBody = $emailReqObject | ConvertTo-Json -Depth 5
+
+                Invoke-WebRequest `
+                    -Uri $emailNotificationUri `
+                    -Method POST `
+                    -Body $emailReqBody `
+                    -ContentType 'application/json' `
+                    -ErrorAction Stop
+
+            } catch {
+                Write-Warning "Failed to send email to $emailaddress"
+            }
+        }
+
+        throw "Stopping execution due to API failure: $statusCode"
     }
 
+    # ✅ SUCCESS → Parse response
     $content = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
     $response = $content | ConvertFrom-Json
 
-    # Handle empty response ALSO
+    # ⚠️ EMPTY RESPONSE → DO NOT STOP
     if (-not $response -or -not $response.result -or $response.result.Count -eq 0) {
 
-        Write-Host "API returned empty data"
+        $errorType = "EMPTY_RESPONSE"
+        $statusCode = "200 (Empty)"
+        $errorContent = "Response was empty or missing result"
 
-        Send-ErrorEmail `
-            -Subject "API Returned Empty Response" `
-            -Body "URI: $uri `nResponse was empty or null"
+        $emailBody = @"
+<html>
+<body>
+<h3>⚠️ API Empty Response</h3>
 
-        return
+<p><b>Timestamp:</b> $(Get-Date)</p>
+<p><b>URI:</b> $uri</p>
+<p><b>Status:</b> $statusCode</p>
+
+<pre>$errorContent</pre>
+
+</body>
+</html>
+"@
+
+        foreach ($emailaddress in $EmailAddressCCChain.Split(",")) {
+            try {
+                $emailReqObject = @{
+                    to      = $emailaddress.Trim()
+                    subject = "API Empty Response"
+                    body    = $emailBody
+                    isHtml  = $true
+                }
+
+                $emailReqBody = $emailReqObject | ConvertTo-Json -Depth 5
+
+                Invoke-WebRequest `
+                    -Uri $emailNotificationUri `
+                    -Method POST `
+                    -Body $emailReqBody `
+                    -ContentType 'application/json' `
+                    -ErrorAction Stop
+
+            } catch {
+                Write-Warning "Failed to send email to $emailaddress"
+            }
+        }
+
+        # 🔥 IMPORTANT: No return → continue execution
     }
+
+    Write-Host "API call successful — continuing execution"
+
+    # 👉 Your further logic continues here
+
 }
 catch {
-    Write-Host "API call failed"
-    Write-Host $_
 
-    # SEND EMAIL (for unexpected failures like timeout, DNS, etc.)
-    Send-ErrorEmail `
-        -Subject "API Exception Occurred" `
-        -Body "URI: $uri `nError: $($_ | Out-String)"
+    $errorContent = $_ | Out-String
 
-    throw
+    $emailBody = @"
+<html>
+<body>
+<h3>🔥 API Exception Occurred</h3>
+
+<p><b>Timestamp:</b> $(Get-Date)</p>
+<p><b>URI:</b> $uri</p>
+
+<pre>$errorContent</pre>
+
+</body>
+</html>
+"@
+
+    foreach ($emailaddress in $EmailAddressCCChain.Split(",")) {
+        try {
+            $emailReqObject = @{
+                to      = $emailaddress.Trim()
+                subject = "API Exception Occurred"
+                body    = $emailBody
+                isHtml  = $true
+            }
+
+            $emailReqBody = $emailReqObject | ConvertTo-Json -Depth 5
+
+            Invoke-WebRequest `
+                -Uri $emailNotificationUri `
+                -Method POST `
+                -Body $emailReqBody `
+                -ContentType 'application/json' `
+                -ErrorAction Stop
+
+        } catch {
+            Write-Warning "Failed to send exception email to $emailaddress"
+        }
+    }
+
+    throw  # ✅ Real exception → stop execution
 }
