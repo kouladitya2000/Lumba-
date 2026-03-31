@@ -1,146 +1,17 @@
-try {
-    Write-Host "Calling API: $uri"
+function Send-GuardiumEmail {
+    param (
+        [string]$subject,
+        [string]$body
+    )
 
-    $httpResponse = $client.GetAsync($uri).GetAwaiter().GetResult()
+    $emails = $EmailAddressGuardiumChain -split ","
 
-    # ❌ API FAILURE → STOP execution
-    if (-not $httpResponse.IsSuccessStatusCode) {
-
-        $errorContent = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-        $statusCode = $httpResponse.StatusCode
-        $errorType = "API_FAILURE"
-
-        try {
-            $parsed = $errorContent | ConvertFrom-Json
-            $errorContent = $parsed | ConvertTo-Json -Depth 5
-        } catch {}
-
-        $emailBody = @"
-<html>
-<body>
-<h3>🚨 API Error Notification</h3>
-
-<p><b>Error Type:</b> $errorType</p>
-<p><b>Timestamp:</b> $(Get-Date)</p>
-
-<hr>
-
-<p><b>URI:</b> $uri</p>
-<p><b>Status Code:</b> $statusCode</p>
-
-<pre>$errorContent</pre>
-
-</body>
-</html>
-"@
-
-        foreach ($emailaddress in $EmailAddressCCChain.Split(",")) {
-            try {
-                $emailReqObject = @{
-                    to      = $emailaddress.Trim()
-                    subject = "API Failure - StatusCode $statusCode"
-                    body    = $emailBody
-                    isHtml  = $true
-                }
-
-                $emailReqBody = $emailReqObject | ConvertTo-Json -Depth 5
-
-                Invoke-WebRequest `
-                    -Uri $emailNotificationUri `
-                    -Method POST `
-                    -Body $emailReqBody `
-                    -ContentType 'application/json' `
-                    -ErrorAction Stop
-
-            } catch {
-                Write-Warning "Failed to send email to $emailaddress"
-            }
-        }
-
-        throw "Stopping execution due to API failure: $statusCode"
-    }
-
-    # ✅ SUCCESS → Parse response
-    $content = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-    $response = $content | ConvertFrom-Json
-
-    # ⚠️ EMPTY RESPONSE → DO NOT STOP
-    if (-not $response -or -not $response.result -or $response.result.Count -eq 0) {
-
-        $errorType = "EMPTY_RESPONSE"
-        $statusCode = "200 (Empty)"
-        $errorContent = "Response was empty or missing result"
-
-        $emailBody = @"
-<html>
-<body>
-<h3>⚠️ API Empty Response</h3>
-
-<p><b>Timestamp:</b> $(Get-Date)</p>
-<p><b>URI:</b> $uri</p>
-<p><b>Status:</b> $statusCode</p>
-
-<pre>$errorContent</pre>
-
-</body>
-</html>
-"@
-
-        foreach ($emailaddress in $EmailAddressCCChain.Split(",")) {
-            try {
-                $emailReqObject = @{
-                    to      = $emailaddress.Trim()
-                    subject = "API Empty Response"
-                    body    = $emailBody
-                    isHtml  = $true
-                }
-
-                $emailReqBody = $emailReqObject | ConvertTo-Json -Depth 5
-
-                Invoke-WebRequest `
-                    -Uri $emailNotificationUri `
-                    -Method POST `
-                    -Body $emailReqBody `
-                    -ContentType 'application/json' `
-                    -ErrorAction Stop
-
-            } catch {
-                Write-Warning "Failed to send email to $emailaddress"
-            }
-        }
-
-        # 🔥 IMPORTANT: No return → continue execution
-    }
-
-    Write-Host "API call successful — continuing execution"
-
-    # 👉 Your further logic continues here
-
-}
-catch {
-
-    $errorContent = $_ | Out-String
-
-    $emailBody = @"
-<html>
-<body>
-<h3>🔥 API Exception Occurred</h3>
-
-<p><b>Timestamp:</b> $(Get-Date)</p>
-<p><b>URI:</b> $uri</p>
-
-<pre>$errorContent</pre>
-
-</body>
-</html>
-"@
-
-    foreach ($emailaddress in $EmailAddressCCChain.Split(",")) {
+    foreach ($email in $emails) {
         try {
             $emailReqObject = @{
-                to      = $emailaddress.Trim()
-                subject = "API Exception Occurred"
-                body    = $emailBody
+                to      = $email.Trim()
+                subject = $subject
+                body    = $body
                 isHtml  = $true
             }
 
@@ -150,13 +21,11 @@ catch {
                 -Uri $emailNotificationUri `
                 -Method POST `
                 -Body $emailReqBody `
-                -ContentType 'application/json' `
+                -ContentType "application/json" `
                 -ErrorAction Stop
-
-        } catch {
-            Write-Warning "Failed to send exception email to $emailaddress"
+        }
+        catch {
+            Write-Warning "Failed to send email to $email"
         }
     }
-
-    throw  # ✅ Real exception → stop execution
 }
