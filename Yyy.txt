@@ -1,89 +1,13 @@
-try {
-    Write-Host "Starting API execution..."
+if($missingFiles.Count -gt 0)
+{
+    $functionName = "KCIReporting"   # since both map to same function
+    $url = "https://$functionAppName.azurewebsites.net/admin/functions/$functionName"
 
-    # -------------------------------
-    # CALL API
-    # -------------------------------
-    $httpResponse = $client.GetAsync($uri).GetAwaiter().GetResult()
+    Invoke-WebRequest -Uri $url -Headers $header -Method Post -Body $bodyJson
 
-    if (-not $httpResponse.IsSuccessStatusCode) {
-
-        $statusCode   = $httpResponse.StatusCode
-        $errorContent = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-
-        try {
-            $parsed = $errorContent | ConvertFrom-Json
-            $errorContent = $parsed | ConvertTo-Json -Depth 5
-        } catch {}
-
-        $emailBody = @"
-<html>
-<body>
-<h3>❌ API Failure</h3>
-<p><b>Status Code:</b> $statusCode</p>
-<p><b>URI:</b> $uri</p>
-<pre>$errorContent</pre>
-</body>
-</html>
-"@
-
-        Send-GuardiumEmail -subject "API Failure - $statusCode" -body $emailBody
-
-        throw "API failure with status code: $statusCode"
-    }
-
-    # -------------------------------
-    # SUCCESS → PARSE RESPONSE
-    # -------------------------------
-    $content  = $httpResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-    $response = $content | ConvertFrom-Json
-
-    # -------------------------------
-    # EMPTY RESPONSE HANDLING
-    # -------------------------------
-    if (-not $response -or -not $response.result -or $response.result.Count -eq 0) {
-
-        $emailBody = @"
-<html>
-<body>
-<h3>⚠️ API Empty Response</h3>
-<p><b>URI:</b> $uri</p>
-<p><b>Timestamp:</b> $(Get-Date)</p>
-</body>
-</html>
-"@
-
-        Send-GuardiumEmail -subject "API Empty Response" -body $emailBody
-
-        Write-Warning "Empty response received. Continuing execution..."
-    }
-    else {
-        Write-Host "API call successful. Records found: $($response.result.Count)"
-    }
-
-    # -------------------------------
-    # CONTINUE YOUR LOGIC
-    # -------------------------------
-    # (your tenant filtering, graph query etc.)
-
+    Write-Host "Triggered function once for missing files"
 }
-catch {
-    Write-Error "Exception occurred: $_"
-
-    $errorContent = $_ | Out-String
-
-    $emailBody = @"
-<html>
-<body>
-<h3>🔥 API Exception Occurred</h3>
-<p><b>Timestamp:</b> $(Get-Date)</p>
-<p><b>URI:</b> $uri</p>
-<pre>$errorContent</pre>
-</body>
-</html>
-"@
-
-    Send-GuardiumEmail -subject "API Exception Occurred" -body $emailBody
-
-    throw   # rethrow so Azure Function marks failure (important)
+else
+{
+    Write-Host "All files present"
 }
