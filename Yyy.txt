@@ -1,13 +1,27 @@
-if($missingFiles.Count -gt 0)
-{
-    $functionName = "KCIReporting"   # since both map to same function
-    $url = "https://$functionAppName.azurewebsites.net/admin/functions/$functionName"
+    $triggeredFunctions = @()
 
-    Invoke-WebRequest -Uri $url -Headers $header -Method Post -Body $bodyJson
+    foreach ($missingFile in $missingFiles) {
 
-    Write-Host "Triggered function once for missing files"
+        if ($fileFunctionMap.ContainsKey($missingFile)) {
+
+            $functionName = $fileFunctionMap[$missingFile]
+
+            if ($triggeredFunctions -notcontains $functionName) {
+
+                $triggeredFunctions += $functionName
+
+                $url = "https://$functionAppName.azurewebsites.net/admin/functions/$functionName"
+
+                Invoke-WebRequest -Uri $url -Headers $header -Method Post -Body $bodyJson
+
+                Write-Host "Triggered function: $functionName"
+                Write-Host "Starting Sleep before next trigger"
+
+                Start-Sleep -Seconds 240
+            }
+        }
+    }
 }
-else
-{
-    Write-Host "All files present"
+else {
+    Write-Output "All files present"
 }
