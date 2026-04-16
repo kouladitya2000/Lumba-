@@ -1,13 +1,26 @@
-$storageAccountName = "yourstorageaccount"
-$containerName = "yourcontainer"
-$filePath = "C:\temp\file.txt"
+# Variables
+$storageAccountName = "yourstorageaccountname"
+$resourceGroupName  = "your-resource-group"
+$folderPath         = "C:\Your\Output\Folder"
+
+# Login (or use Managed Identity if in Azure Function)
+Connect-AzAccount
 
 # Get storage context
-$ctx = (Get-AzStorageAccount -Name $storageAccountName -ResourceGroupName "your-rg").Context
+$storageAccount = Get-AzStorageAccount -ResourceGroupName $resourceGroupName -Name $storageAccountName
+$ctx = $storageAccount.Context
 
-# Upload file
-Set-AzStorageBlobContent `
-    -File $filePath `
-    -Container $containerName `
-    -Blob "file.txt" `
-    -Context $ctx
+# Upload all files FLAT (no folders)
+Get-ChildItem -Path $folderPath -File -Recurse | ForEach-Object {
+
+    $blobName = $_.Name   # 🔥 only file name, no folder path
+
+    Write-Output "Uploading: $blobName"
+
+    Set-AzStorageBlobContent `
+        -File $_.FullName `
+        -Container '$web' `
+        -Blob $blobName `
+        -Context $ctx `
+        -Force
+}
