@@ -1,27 +1,13 @@
-    $triggeredFunctions = @()
+$storageAccountName = "yourstorageaccount"
+$containerName = "yourcontainer"
+$filePath = "C:\temp\file.txt"
 
-    foreach ($missingFile in $missingFiles) {
+# Get storage context
+$ctx = (Get-AzStorageAccount -Name $storageAccountName -ResourceGroupName "your-rg").Context
 
-        if ($fileFunctionMap.ContainsKey($missingFile)) {
-
-            $functionName = $fileFunctionMap[$missingFile]
-
-            if ($triggeredFunctions -notcontains $functionName) {
-
-                $triggeredFunctions += $functionName
-
-                $url = "https://$functionAppName.azurewebsites.net/admin/functions/$functionName"
-
-                Invoke-WebRequest -Uri $url -Headers $header -Method Post -Body $bodyJson
-
-                Write-Host "Triggered function: $functionName"
-                Write-Host "Starting Sleep before next trigger"
-
-                Start-Sleep -Seconds 240
-            }
-        }
-    }
-}
-else {
-    Write-Output "All files present"
-}
+# Upload file
+Set-AzStorageBlobContent `
+    -File $filePath `
+    -Container $containerName `
+    -Blob "file.txt" `
+    -Context $ctx
