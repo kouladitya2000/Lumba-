@@ -1,26 +1,48 @@
-# Variables
-$storageAccountName = "yourstorageaccountname"
-$resourceGroupName  = "your-resource-group"
-$folderPath         = "C:\Your\Output\Folder"
+function Upload-StaticWebsiteFile {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$StorageAccountName,
 
-# Login (or use Managed Identity if in Azure Function)
-Connect-AzAccount
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
 
-# Get storage context
-$storageAccount = Get-AzStorageAccount -ResourceGroupName $resourceGroupName -Name $storageAccountName
-$ctx = $storageAccount.Context
+        [string]$ContainerName = '$web'
+    )
 
-# Upload all files FLAT (no folders)
-Get-ChildItem -Path $folderPath -File -Recurse | ForEach-Object {
+    try {
+        Write-Host "Uploading file: $FilePath"
 
-    $blobName = $_.Name   # 🔥 only file name, no folder path
+        # Get file name
+        $fileName = [System.IO.Path]::GetFileName($FilePath)
 
-    Write-Output "Uploading: $blobName"
+        # Determine Content-Type
+        $extension = [System.IO.Path]::GetExtension($FilePath).ToLower()
 
-    Set-AzStorageBlobContent `
-        -File $_.FullName `
-        -Container '$web' `
-        -Blob $blobName `
-        -Context $ctx `
-        -Force
+        switch ($extension) {
+            ".html" { $contentType = "text/html" }
+            ".csv"  { $contentType = "text/csv" }
+            default { $contentType = "application/octet-stream" }
+        }
+
+        Write-Host "Detected Content-Type: $contentType"
+
+        # Get storage context using connected account (SPN)
+        $ctx = New-AzStorageContext -StorageAccountName $StorageAccountName -UseConnectedAccount
+
+        # Upload blob with correct content type
+        Set-AzStorageBlobContent `
+            -File $FilePath `
+            -Container $ContainerName `
+            -Blob $fileName `
+            -Context $ctx `
+            -Properties @{"ContentType" = $contentType} `
+            -Force
+
+        Write-Host "Upload successful: $fileName"
+    }
+    catch {
+        Write-Error "Upload failed for $FilePath"
+        Write-Error $_.Exception.Message
+        throw
+    }
 }
