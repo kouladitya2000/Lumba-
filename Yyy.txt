@@ -1,48 +1,43 @@
-function Upload-StaticWebsiteFile {
-    param (
-        [Parameter(Mandatory = $true)]
-        [string]$StorageAccountName,
+param($Timer)
 
-        [Parameter(Mandatory = $true)]
-        [string]$FilePath,
+Write-Host "[$(Get-Date -Format 'u')] Starting cleanup of `$web container..."
 
-        [string]$ContainerName = '$web'
-    )
+try {
+    $storageAccountName = $env:STORAGE_ACCOUNT_NAME
 
-    try {
-        Write-Host "Uploading file: $FilePath"
+    if (-not $storageAccountName) {
+        throw "Missing STORAGE_ACCOUNT_NAME in app settings."
+    }
 
-        # Get file name
-        $fileName = [System.IO.Path]::GetFileName($FilePath)
+    $ctx = New-AzStorageContext `
+        -StorageAccountName $storageAccountName `
+        -UseConnectedAccount
 
-        # Determine Content-Type
-        $extension = [System.IO.Path]::GetExtension($FilePath).ToLower()
+    $containerName = '$web'
 
-        switch ($extension) {
-            ".html" { $contentType = "text/html" }
-            ".csv"  { $contentType = "text/csv" }
-            default { $contentType = "application/octet-stream" }
-        }
+    # Safety check
+    if ($containerName -ne '$web') {
+        throw "Safety check failed: only `$web container is allowed."
+    }
 
-        Write-Host "Detected Content-Type: $contentType"
+    $deletedCount = 0
 
-        # Get storage context using connected account (SPN)
-        $ctx = New-AzStorageContext -StorageAccountName $StorageAccountName -UseConnectedAccount
+    # Stream + delete with logging
+    Get-AzStorageBlob -Container $containerName -Context $ctx | ForEach-Object {
+        Write-Host "Deleting blob: $($_.Name)"
 
-        # Upload blob with correct content type
-        Set-AzStorageBlobContent `
-            -File $FilePath `
-            -Container $ContainerName `
-            -Blob $fileName `
+        Remove-AzStorageBlob `
+            -Container $containerName `
+            -Blob $_.Name `
             -Context $ctx `
-            -Properties @{"ContentType" = $contentType} `
             -Force
 
-        Write-Host "Upload successful: $fileName"
+        $deletedCount++
     }
-    catch {
-        Write-Error "Upload failed for $FilePath"
-        Write-Error $_.Exception.Message
-        throw
-    }
+
+    Write-Host "✅ `$web container cleanup completed. Total blobs deleted: $deletedCount"
+}
+catch {
+    Write-Error "❌ Cleanup failed: $_"
+    throw
 }
