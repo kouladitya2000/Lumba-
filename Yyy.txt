@@ -1,43 +1,11 @@
-param($Timer)
+Temporary Data Unavailability
 
-Write-Host "[$(Get-Date -Format 'u')] Starting cleanup of `$web container..."
+The data is currently unavailable due to a scheduled refresh process.
 
-try {
-    $storageAccountName = $env:STORAGE_ACCOUNT_NAME
+This refresh takes place every Sunday between 02:35 UTC and 02:50 UTC. During this time, content may be temporarily unavailable.
 
-    if (-not $storageAccountName) {
-        throw "Missing STORAGE_ACCOUNT_NAME in app settings."
-    }
+Data is expected to be available by 19:48 UTC (latest by 20:00 UTC). Please check back after this time.
 
-    $ctx = New-AzStorageContext `
-        -StorageAccountName $storageAccountName `
-        -UseConnectedAccount
+If the data is still unavailable or does not appear as expected after this time, please reach out to Aditya or Simon for assistance.
 
-    $containerName = '$web'
-
-    # Safety check
-    if ($containerName -ne '$web') {
-        throw "Safety check failed: only `$web container is allowed."
-    }
-
-    $deletedCount = 0
-
-    # Stream + delete with logging
-    Get-AzStorageBlob -Container $containerName -Context $ctx | ForEach-Object {
-        Write-Host "Deleting blob: $($_.Name)"
-
-        Remove-AzStorageBlob `
-            -Container $containerName `
-            -Blob $_.Name `
-            -Context $ctx `
-            -Force
-
-        $deletedCount++
-    }
-
-    Write-Host "✅ `$web container cleanup completed. Total blobs deleted: $deletedCount"
-}
-catch {
-    Write-Error "❌ Cleanup failed: $_"
-    throw
-}
+Thank you for your patience.
