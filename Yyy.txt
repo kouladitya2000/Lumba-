@@ -1,11 +1,7 @@
-Temporary Data Unavailability
+lTemporary Data Unavailability
 
-The data is currently unavailable due to a scheduled refresh process.
+Data is temporarily unavailable due to a scheduled refresh every Sunday between 02:35 UTC and 02:50 UTC.
 
-This refresh takes place every Sunday between 02:35 UTC and 02:50 UTC. During this time, content may be temporarily unavailable.
+Data will be available once the scheduled runs are completed.
 
-Data is expected to be available by 19:48 UTC (latest by 20:00 UTC). Please check back after this time.
-
-If the data is still unavailable or does not appear as expected after this time, please reach out to Aditya or Simon for assistance.
-
-Thank you for your patience.
+If the data is still unavailable or not as expected after 19:48 UTC (latest by 20:00 UTC), please reach out to Aditya or Simon.
