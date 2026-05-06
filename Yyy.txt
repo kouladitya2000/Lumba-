@@ -1,50 +1,41 @@
-param($Timer)
+Minute
 
-Write-Host "[$(Get-Date -Format 'u')] Starting cleanup of `$web container..."
+Hours (UTC)
 
-try {
-    $storageAccountName = $env:STORAGE_ACCOUNT_NAME
+Times
 
-    if (-not $storageAccountName) {
-        throw "Missing STORAGE_ACCOUNT_NAME in app settings."
-    }
+0
 
-    $ctx = New-AzStorageContext `
-        -StorageAccountName $storageAccountName `
-        -UseConnectedAccount
+0, 8, 16
 
-    $containerName = '$web'
+00:00, 08:00, 16:00
 
-    # Safety check
-    if ($containerName -ne '$web') {
-        throw "Safety check failed: only `$web container is allowed."
-    }
+10
 
-    $deletedCount = 0
-    $skippedCount = 0
+0, 8, 16
 
-    Get-AzStorageBlob -Container $containerName -Context $ctx | ForEach-Object {
+00:10, 08:10, 16:10
 
-        if ($_.Name -eq "error.html") {
-            Write-Host "Skipping protected blob: $($_.Name)"
-            $skippedCount++
-            return
-        }
+20
 
-        Write-Host "Deleting blob: $($_.Name)"
+0, 8, 16
 
-        Remove-AzStorageBlob `
-            -Container $containerName `
-            -Blob $_.Name `
-            -Context $ctx `
-            -Force
+00:20, 08:20, 16:20
 
-        $deletedCount++
-    }
+30
 
-    Write-Host "✅ Cleanup completed. Deleted: $deletedCount | Skipped: $skippedCount"
-}
-catch {
-    Write-Error "❌ Cleanup failed: $_"
-    throw
-}
+0, 8, 16
+
+00:30, 08:30, 16:30
+
+40
+
+0, 8, 16
+
+00:40, 08:40, 16:40
+
+50
+
+0, 8, 16
+
+00:50, 08:50, 16:50
