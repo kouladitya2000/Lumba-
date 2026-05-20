@@ -1,41 +1,10 @@
-Minute
+Hi Sagar,  
+Hope you are well.
 
-Hours (UTC)
+I had surgery this Saturday (16th May) for the scars from my previous accident.
 
-Times
+HR Direct informed me that I cannot raise the HR case myself for this request and that it needs to be raised by the functional manager.
 
-0
+I spoke with Syd regarding the same. However, since he is currently out of office and does not have access to his laptop, he suggested waiting until Tuesday for him to complete it.
 
-0, 8, 16
-
-00:00, 08:00, 16:00
-
-10
-
-0, 8, 16
-
-00:10, 08:10, 16:10
-
-20
-
-0, 8, 16
-
-00:20, 08:20, 16:20
-
-30
-
-0, 8, 16
-
-00:30, 08:30, 16:30
-
-40
-
-0, 8, 16
-
-00:40, 08:40, 16:40
-
-50
-
-0, 8, 16
-
-00:50, 08:50, 16:50
+Could you please let me know if this can wait until Tuesday?
