@@ -1,1 +1,6 @@
-
+AzureActivity
+| where ResourceProviderValue =~ "MICROSOFT.NETWORK"
+| where Resource contains "<nsg-name>"
+| where OperationNameValue contains "networkSecurityGroups/write"
+| project TimeGenerated, Caller, OperationNameValue, ResourceGroup, ActivityStatusValue
+| order by TimeGenerated asc
