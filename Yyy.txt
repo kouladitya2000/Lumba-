@@ -1,6 +1,114 @@
-AzureActivity
-| where ResourceProviderValue =~ "MICROSOFT.NETWORK"
-| where Resource contains "<nsg-name>"
-| where OperationNameValue contains "networkSecurityGroups/write"
-| project TimeGenerated, Caller, OperationNameValue, ResourceGroup, ActivityStatusValue
-| order by TimeGenerated asc
+resource "azurerm_resource_group" "sa_rg-<unique_id>" {
+  name     = "papa-cibesgphysicalrisk-nonprod-03-rg-sa-01"
+  location = "northeurope"
+
+  tags = local.tags
+
+  lifecycle {
+    ignore_changes = [tags]
+  }
+}
+
+module "lz_sa_eun_np_01-<unique_id>" {
+  source = "https://nexus302.systems.uk.papa:8081/nexus/repository/raw-alm-prod_n3p/com/papa/cto/cloud/acst/tfmodules/v2.6.0/v2.6.0.zip//terraform-azurerm-storage-account"
+
+  storage_accounts = {
+    sa1 = {
+      name                = replace(local.deploy_name, "-", "")
+      use_naming_convention = false
+
+      blob_properties = {
+        versioning_enabled  = true
+        change_feed_enabled = true
+        change_feed_retention_in_days = 7
+
+        delete_retention_policy = {
+          days = 7
+        }
+
+        container_delete_retention_policy = {
+          days = 7
+        }
+      }
+    }
+  }
+
+  environment         = "np"
+  resource_group_name = azurerm_resource_group.automation.name
+  location            = "northeurope"
+  project             = "central"
+
+  private_endpoint_subnet_id   = module.lz_vnet_eun_01-<unique_id>[0].vnet_subnets[0]
+  cmk_key_vault_name           = module.lz_kv_eun_np_01-<unique_id>.name.kv1
+  cmk_key_vault_resource_group = azurerm_resource_group.kv_rg-<unique_id>.name
+  cmk_key_vault_key_name       = replace(local.deploy_name, "-", "")
+  use_cmk_access_policy        = false
+
+  tags = local.tags
+
+  depends_on = [
+    module.cmk_key_01-<unique_id>,
+    module.lz_vnet_eun_01-<unique_id>
+  ]
+}
+
+module "cmk_key_01-<unique_id>" {
+  source       = "https://nexus302.systems.uk.papa:8081/nexus/repository/raw-alm-prod_n3p/com/papa/cto/cloud/acst/tfmodules/v2.6.0/v2.6.0.zip//terraform-azurerm-key-vault-key"
+  key_vault_id = module.lz_kv_eun_np_01-<unique_id>.id.kv1
+
+  key_vault_keys = {
+    key01 = {
+      name     = replace(local.deploy_name, "-", "")
+      key_type = "RSA"
+      key_size = "3072"
+      key_opts = ["decrypt", "encrypt", "sign", "unwrapKey", "verify", "wrapKey"]
+
+      expiration_date = "2026-07-20T23:59:59+00:00"
+
+      rotation_policy = {
+        automatic = {
+          time_before_expiry = "P30D"
+        }
+        expire_after        = "P90D"
+        notify_before_expiry = "P29D"
+      }
+    }
+  }
+
+  tags = local.tags
+
+  depends_on = [
+    azurerm_role_assignment.mgmtspn_kv_cor-<unique_id>
+  ]
+}
+
+module "sa_container_01-<unique_id>" {
+  source             = "https://nexus302.systems.uk.papa:8081/nexus/repository/raw-alm-prod_n3p/com/papa/cto/cloud/acst/tfmodules/v2.6.0/v2.6.0.zip//terraform-azurerm-storage-container"
+  storage_account_id = module.lz_sa_eun_np_01-<unique_id>.id.sa1
+
+  storage_containers = {
+    container1 = {
+      name                = "tfstate-container"
+      use_naming_convention = false
+    }
+  }
+
+  environment = "np"
+  location    = "northeurope"
+  project     = "central"
+
+  depends_on = [
+    module.lz_sa_eun_np_01-<unique_id>
+  ]
+}
+
+# Grant Subscription SPN the Storage Blob Data Contributor Role
+resource "azurerm_role_assignment" "spn_sa_bdcr-<unique_id>" {
+  scope                = "/subscriptions/<subscription_id>/resourceGroups/${azurerm_resource_group.automation.name}/providers/Microsoft.Storage/storageAccounts/${replace(local.deploy_name, "-", "")}"
+  role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = "6ad3a6aa-4daa-4bd9-8098-e3f8a3fc96a3"
+
+  depends_on = [
+    module.lz_sa_eun_np_01-<unique_id>
+  ]
+}
