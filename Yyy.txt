@@ -1,20 +1,16 @@
-param($Timer)
+# Variables
+$spnObjectId = "92d83cb2-636d-4803-91c1-14a428661eba"
+$resourceGroupName = "compliance-ps-fa-eun-np-01"
+$subscriptionId = "178f8664-a24f-4896-b391-0de46e5a424a"
 
-Import-Module AutomationModules/acst.az.autohelper
+# Connect to Azure (if not already connected)
+Connect-AzAccount
 
-# Get the current universal time in the default string format
-$currentUTCtime = (Get-Date).ToUniversalTime()
+# Set subscription context
+Set-AzContext -SubscriptionId $subscriptionId
 
-# Write an information log with the current time.
-Write-Host "PowerShell timer trigger function ran! TIME: $currentUTCtime"
-
-try {
-    Connect-AzAccount -Identity -AccountId $env:MSI_CLIENT_ID
-}
-catch {
-    Write-Host "Error connecting to Azure. $_.Exception"
-    throw $_.Exception
-}
-
-$todayDate = Get-Date -Format "dddd, MMMM dd, yyyy"
-Write-Host "Hello! Today's date is $todayDate"
+# Grant Contributor role on Resource Group
+New-AzRoleAssignment `
+  -ObjectId $spnObjectId `
+  -RoleDefinitionName "Contributor" `
+  -ResourceGroupName $resourceGroupName
