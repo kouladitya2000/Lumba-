@@ -1,18 +1,17 @@
-Hi Syd,
+# Variables
+$SubscriptionId = "<subscription-id>"
+$ResourceGroupName = "<functionapp-rg>"
+$SpnObjectId = "<service-principal-object-id>"
 
-Hope you are doing well.
+# Login
+Connect-AzAccount
+Set-AzContext -SubscriptionId $SubscriptionId
 
-As discussed, I underwent scar correction surgery related to my previous accident. The doctor has advised regular follow-ups over the next 3 to 4 months and needs to monitor the scars closely during the healing process to ensure they do not overgrow. There may also be a need for follow-up consultations or treatment at short notice during this period.
+# Get RG scope
+$scope = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName"
 
-Due to this ongoing treatment process, I would like to request work from home until the end of September. I had resumed reporting to the Pune office regularly until the first week of May; however, the scars were impacting my health and required medical treatment.
-
-I am scheduling the follow-up appointments on weekends wherever possible so that my work remains unaffected. I will continue to be fully available during working hours and do not anticipate any impact on my responsibilities.
-
-As HR Direct has informed me that the request needs to be raised by the functional manager, could you please help initiate the HR case for this request?
-
-Please let me know if you need any medical documents or additional information from my side.
-
-Thank you for your continued support.
-
-Kind regards,
-Aditya Koul
+# Assign Contributor role
+New-AzRoleAssignment `
+    -ObjectId $SpnObjectId `
+    -RoleDefinitionName "Contributor" `
+    -Scope $scope
