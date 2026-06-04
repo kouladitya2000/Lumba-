@@ -1,17 +1,25 @@
 # Variables
-$SubscriptionId = "<subscription-id>"
-$ResourceGroupName = "<functionapp-rg>"
-$SpnObjectId = "<service-principal-object-id>"
+$objectId = "24c6dfe6-b225-4d50-bbb7-cb525a7b1a16"
+$resourceGroupName = "compliance-ps-fa-eun-np-01"
+$subscriptionId = "178f8664-a24f-4896-b391-0de46e5a424a"
 
-# Login
-Connect-AzAccount
-Set-AzContext -SubscriptionId $SubscriptionId
+# Set context
+Set-AzContext -SubscriptionId $subscriptionId
 
-# Get RG scope
-$scope = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName"
+# Remove Owner role
+Remove-AzRoleAssignment `
+  -ObjectId $objectId `
+  -RoleDefinitionName "Owner" `
+  -ResourceGroupName $resourceGroupName
 
-# Assign Contributor role
-New-AzRoleAssignment `
-    -ObjectId $SpnObjectId `
-    -RoleDefinitionName "Contributor" `
-    -Scope $scope
+# Remove Website Contributor role
+Remove-AzRoleAssignment `
+  -ObjectId $objectId `
+  -RoleDefinitionName "Website Contributor" `
+  -ResourceGroupName $resourceGroupName
+
+# Remove Contributor role
+Remove-AzRoleAssignment `
+  -ObjectId $objectId `
+  -RoleDefinitionName "Contributor" `
+  -ResourceGroupName $resourceGroupName
