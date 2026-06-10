@@ -1,38 +1,23 @@
-# Connect to Azure (if not already connected)
+# Connect if required
 Connect-AzAccount
 
-# ===== INPUTS =====
-$FunctionAppName = "<FunctionAppName>"
-$FunctionAppRG   = "<FunctionAppResourceGroup>"
+# Managed Identity Object (Principal) ID from Function App -> Identity
+$PrincipalId = "b412d32b-cc89-44ec-8ec8-bdb1e6d125ed"
 
-$AppInsightsName = "<ApplicationInsightsName>"
-$AppInsightsRG   = "<ApplicationInsightsResourceGroup>"
-# ==================
+# Application Insights details
+$AppInsightsName = "<APP_INSIGHTS_NAME>"
+$AppInsightsRG   = "<APP_INSIGHTS_RESOURCE_GROUP>"
 
-# Get Function App Managed Identity Principal ID
-$FunctionApp = Get-AzFunctionApp `
-    -Name $FunctionAppName `
-    -ResourceGroupName $FunctionAppRG
-
-$PrincipalId = $FunctionApp.IdentityPrincipalId
-
-if (-not $PrincipalId) {
-    throw "Managed Identity is not enabled on Function App '$FunctionAppName'."
-}
-
-# Get Application Insights Resource ID
-$AppInsights = Get-AzResource `
+# Get App Insights Resource ID
+$AppInsightsId = (Get-AzResource `
     -ResourceGroupName $AppInsightsRG `
     -ResourceType "Microsoft.Insights/components" `
-    -Name $AppInsightsName
+    -Name $AppInsightsName).ResourceId
 
-$AppInsightsId = $AppInsights.ResourceId
-
-# Create Monitoring Metrics Publisher role assignment
+# Assign Monitoring Metrics Publisher role
 New-AzRoleAssignment `
     -ObjectId $PrincipalId `
     -RoleDefinitionName "Monitoring Metrics Publisher" `
     -Scope $AppInsightsId
 
 Write-Host "Monitoring Metrics Publisher role assigned successfully."
-
