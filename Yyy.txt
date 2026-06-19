@@ -1,1 +1,5 @@
+I demonstrated strong ownership and technical leadership by driving key infrastructure improvements that enhanced the team’s cloud deployment capabilities. I designed and implemented a standardized deployment framework for Azure App Service Environments (ASEs) and Function Apps, enabling both independent and integrated deployments through a reusable and scalable approach. This significantly improved deployment consistency, maintainability, and readiness for future onboarding efforts.
 
+In addition, I established the infrastructure for a dedicated Compliance Function App platform, creating the foundation for modernizing compliance-related workloads and supporting future migration from traditional execution models. This initiative required proactive planning, problem-solving, and close collaboration to ensure the solution aligned with platform standards and long-term objectives.
+
+These contributions have strengthened the team’s operational capabilities by introducing scalable, future-ready infrastructure that improves efficiency, reduces manual effort, and supports continued growth of our cloud platform.
