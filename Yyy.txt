@@ -1,23 +1,66 @@
-# Connect if required
-Connect-AzAccount
+param($Timer)
 
-# Managed Identity Object (Principal) ID from Function App -> Identity
-$PrincipalId = "b412d32b-cc89-44ec-8ec8-bdb1e6d125ed"
+Import-Module AutomationModules/acst.az.autohelper
 
-# Application Insights details
-$AppInsightsName = "<APP_INSIGHTS_NAME>"
-$AppInsightsRG   = "<APP_INSIGHTS_RESOURCE_GROUP>"
+$currentUTCtime = (Get-Date).ToUniversalTime()
+Write-Host "PowerShell timer trigger function ran! TIME: $currentUTCtime"
 
-# Get App Insights Resource ID
-$AppInsightsId = (Get-AzResource `
-    -ResourceGroupName $AppInsightsRG `
-    -ResourceType "Microsoft.Insights/components" `
-    -Name $AppInsightsName).ResourceId
+# ── AUTH ─────────────────────────────────────────────────────────
+$password      = ConvertTo-SecureString $env:application_secret -AsPlainText -Force
+$TenantId      = $env:tenant_id
+$ApplicationId = $env:application_id
+$Credential    = New-Object -TypeName System.Management.Automation.PSCredential `
+                    -ArgumentList $ApplicationId, $password
 
-# Assign Monitoring Metrics Publisher role
-New-AzRoleAssignment `
-    -ObjectId $PrincipalId `
-    -RoleDefinitionName "Monitoring Metrics Publisher" `
-    -Scope $AppInsightsId
+Disable-AzContextAutosave -Scope Process
 
-Write-Host "Monitoring Metrics Publisher role assigned successfully."
+try {
+    Connect-AzAccount -ServicePrincipal -TenantId $TenantId `
+        -Subscription latafa-multi-cstmg-01 -Credential $Credential
+}
+catch {
+    Write-Host "Error connecting to Azure. $_.Exception"
+    throw $_.Exception
+}
+
+# ── CONFIG ───────────────────────────────────────────────────────
+$WorkspaceId = $env:CentralLAWorkspaceId
+$SharedKey   = $env:CentralLAWorkspaceKey
+$LogType     = "CVSS_Score"
+
+$sqlServer   = "latafa-multi-compliance-prod-01-euw-sql-01.database.windows.net"
+$sqlDb       = "latafa-multi-compliance-prod-01-euw-sql-db-reporting-01"
+
+# ── PULL FROM SQL ────────────────────────────────────────────────
+Connect-AzAccount -Identity
+$sqlToken = (Get-AzAccessToken -ResourceUrl "https://database.windows.net/").Token
+
+Write-Host "Querying CVSS table..."
+
+$cvssData = Invoke-Sqlcmd `
+    -ServerInstance $sqlServer `
+    -Database       $sqlDb `
+    -Query          "SELECT * FROM CVSS" `
+    -AccessToken    $sqlToken
+
+Write-Host "Fetched $($cvssData.Count) rows"
+
+# ── PUSH TO LOG ANALYTICS ────────────────────────────────────────
+if ($cvssData.Count -gt 0) {
+
+    $jsonBody = $cvssData |
+        Select-Object -Property * -ExcludeProperty RowError, RowState, Table, ItemArray, HasErrors |
+        ConvertTo-Json -Depth 10 -Compress
+
+    Post-LogAnalyticsData-SupportTickets `
+        -workspaceId $WorkspaceId `
+        -sharedKey   $SharedKey `
+        -body        $jsonBody `
+        -logType     $LogType
+
+    Write-Host "✅ Done. CVSS data pushed to CVSS_Score_CL" -ForegroundColor Green
+
+} else {
+    Write-Host "⚠️ CVSS table is empty. Nothing to push." -ForegroundColor Yellow
+}
+
