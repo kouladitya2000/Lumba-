@@ -1,1 +1,79 @@
+param($Timer)
 
+Import-Module AutomationModules/acst.az.autohelper
+
+$currentUTCtime = (Get-Date).ToUniversalTime()
+Write-Host "PowerShell timer trigger function ran! TIME: $currentUTCtime"
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
+$password      = ConvertTo-SecureString $env:application_secret -AsPlainText -Force
+$TenantId      = $env:tenant_id
+$ApplicationId = $env:application_id
+$Credential    = New-Object -TypeName System.Management.Automation.PSCredential `
+                    -ArgumentList $ApplicationId, $password
+Disable-AzContextAutosave -Scope Process
+
+try {
+    Connect-AzAccount -ServicePrincipal -TenantId $TenantId `
+        -Subscription hsbc-multi-compliance-nonprod-02 -Credential $Credential
+}
+catch {
+    Write-Host "Error connecting to Azure. $_.Exception"
+    throw $_.Exception
+}
+
+# ── KQL Query ──────────────────────────────────────────────────────────────────
+$KqlQuery = @"
+FunctionAppLogs
+| where TimeGenerated > ago(24h)
+| where Level == "Error"
+| summarize FailureCount = count() by FunctionName
+| where FailureCount > 0
+| order by FailureCount desc
+"@
+
+Write-Host "Querying Application Insights for failed function invocations..."
+
+try {
+    $WorkspaceId  = $env:FuncAppInsightsWorkspaceId
+    $queryResult  = Invoke-AzOperationalInsightsQuery `
+                        -WorkspaceId $WorkspaceId `
+                        -Query $KqlQuery
+    $failedFunctions = $queryResult.Results
+}
+catch {
+    $functionName = $MyInvocation.MyCommand.Name
+    $errorMessage = "Error querying Application Insights in function '$functionName': $($_.Exception.Message)"
+    Write-Host "Error querying Application Insights. $($_.Exception.Message)"
+    Email-Alert -FunctionName $functionName -ErrorMessage $errorMessage
+    throw $_.Exception
+}
+
+Write-Host "Fetched $(@($failedFunctions).Count) function(s) with failures in last 24hrs"
+
+# ── Report ─────────────────────────────────────────────────────────────────────
+if ($failedFunctions.Count -gt 0) {
+
+    $reportLines = [System.Collections.Generic.List[string]]::new()
+    $reportLines.Add("Failed Function Invocations Report - Last 24 Hours")
+    $reportLines.Add("Function App : compliance-ps-fa-eun-np-01")
+    $reportLines.Add("Generated    : $currentUTCtime UTC")
+    $reportLines.Add("=" * 60)
+
+    foreach ($fn in $failedFunctions) {
+        Write-Host "FAILED: $($fn.FunctionName) | Failures: $($fn.FailureCount)"
+        $reportLines.Add("Function : $($fn.FunctionName)")
+        $reportLines.Add("Failures : $($fn.FailureCount)")
+        $reportLines.Add("-" * 40)
+    }
+
+    $emailBody    = $reportLines -join "`n"
+    $functionName = $MyInvocation.MyCommand.Name
+
+    Email-Alert -FunctionName $functionName -ErrorMessage $emailBody
+
+    Write-Host "✅ Alert sent for $($failedFunctions.Count) failed function(s)." -ForegroundColor Green
+
+} else {
+    Write-Host "✅ All functions healthy. No failures in last 24hrs." -ForegroundColor Green
+}
