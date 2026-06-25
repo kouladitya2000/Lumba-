@@ -1,79 +1,102 @@
 param($Timer)
 
 Import-Module AutomationModules/acst.az.autohelper
-
 $currentUTCtime = (Get-Date).ToUniversalTime()
 Write-Host "PowerShell timer trigger function ran! TIME: $currentUTCtime"
 
-# ── Auth ───────────────────────────────────────────────────────────────────────
-$password      = ConvertTo-SecureString $env:application_secret -AsPlainText -Force
-$TenantId      = $env:tenant_id
+$password = ConvertTo-SecureString $env:application_secret -AsPlainText -Force
+$TenantId = $env:tenant_id
 $ApplicationId = $env:application_id
-$Credential    = New-Object -TypeName System.Management.Automation.PSCredential `
-                    -ArgumentList $ApplicationId, $password
+$Credential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $ApplicationId, $password
 Disable-AzContextAutosave -Scope Process
-
 try {
-    Connect-AzAccount -ServicePrincipal -TenantId $TenantId `
-        -Subscription hsbc-multi-compliance-nonprod-02 -Credential $Credential
+    Connect-AzAccount -ServicePrincipal -TenantId $TenantId -Subscription hsbc-multi-cstmg-01 -Credential $Credential
 }
 catch {
     Write-Host "Error connecting to Azure. $_.Exception"
     throw $_.Exception
 }
 
-# ── KQL Query ──────────────────────────────────────────────────────────────────
+#KQL Query
 $KqlQuery = @"
-FunctionAppLogs
-| where TimeGenerated > ago(24h)
-| where Level == "Error"
-| summarize FailureCount = count() by FunctionName
-| where FailureCount > 0
-| order by FailureCount desc
+resources
+| where type =~ 'Microsoft.Compute/virtualMachines'
+| where tags['Production'] =~ 'No'
+| where tags['VM Type'] =~ 'Cattle'
+| where tags['cattleAgeCompliance'] =~ 'Non-Compliant'
+| where tags['VM Role'] != 'Appliance'
+| where isempty(tags['DatabricksEnvironment'])
+    and isempty(tags['databricks-environment'])
+    and (isempty(tags['aks-managed-orchestrator']) or tags['aks-managed-orchestrator'] !startswith 'Kubernetes')
+    and (isempty(tags['Vendor']) or tags['Vendor'] !contains 'Databricks')
+| project id, name, resourceGroup, subscriptionId, location
 "@
 
-Write-Host "Querying Application Insights for failed function invocations..."
+#Query Resource Graph
+Write-Host "Querying Resource Graph for non-compliant cattle VMs..."
 
 try {
-    $WorkspaceId  = $env:FuncAppInsightsWorkspaceId
-    $queryResult  = Invoke-AzOperationalInsightsQuery `
-                        -WorkspaceId $WorkspaceId `
-                        -Query $KqlQuery
-    $failedFunctions = $queryResult.Results
+    $vmList = Search-AzGraph -Query $KqlQuery -First 1000
 }
 catch {
     $functionName = $MyInvocation.MyCommand.Name
-    $errorMessage = "Error querying Application Insights in function '$functionName': $($_.Exception.Message)"
-    Write-Host "Error querying Application Insights. $($_.Exception.Message)"
+    $errorMessage = "Error querying Resource Graph in function '$functionName': $($_.Exception.Message)"
+    Write-Host "Error querying Resource Graph. $($_.Exception.Message)"
     Email-Alert -FunctionName $functionName -ErrorMessage $errorMessage
     throw $_.Exception
 }
 
-Write-Host "Fetched $(@($failedFunctions).Count) function(s) with failures in last 24hrs"
+Write-Host "Fetched $(@($vmList).Count) non-compliant VM(s)"
 
-# ── Report ─────────────────────────────────────────────────────────────────────
-if ($failedFunctions.Count -gt 0) {
+#VM List data print
+Foreach ($vm in $vmList) {
+    Write-Host "VM Name: $($vm.name), Resource Group: $($vm.resourceGroup), Subscription ID: $($vm.subscriptionId), Location: $($vm.location)"
+}
 
-    $reportLines = [System.Collections.Generic.List[string]]::new()
-    $reportLines.Add("Failed Function Invocations Report - Last 24 Hours")
-    $reportLines.Add("Function App : compliance-ps-fa-eun-np-01")
-    $reportLines.Add("Generated    : $currentUTCtime UTC")
-    $reportLines.Add("=" * 60)
+#Shutdown Loop
+if ($vmList.Count -gt 0) {
 
-    foreach ($fn in $failedFunctions) {
-        Write-Host "FAILED: $($fn.FunctionName) | Failures: $($fn.FailureCount)"
-        $reportLines.Add("Function : $($fn.FunctionName)")
-        $reportLines.Add("Failures : $($fn.FailureCount)")
-        $reportLines.Add("-" * 40)
+    foreach ($vm in $vmList) {
+        $logCtx = "VM=[$($vm.name)] RG=[$($vm.resourceGroup)] Sub=[$($vm.subscriptionId)]"
+        Write-Host "Processing: $logCtx"
+
+        # Switch context to VM's subscription to fetch power state
+        Set-AzContext -SubscriptionId $vm.subscriptionId | Out-Null
+
+        # Check power state - only proceed if VM is running
+        $powerState = (Get-AzVM -ResourceGroupName $vm.resourceGroup -Name $vm.name -Status).Statuses |
+                      Where-Object { $_.Code -like 'PowerState/*' } |
+                      Select-Object -ExpandProperty Code
+
+        if ($powerState -ne 'PowerState/running') {
+            Write-Host "⏭ VM not running (current state: $powerState), skipping: $logCtx"
+            continue
+        }
+
+        try {
+            Stop-AzVM `
+                -Name              $vm.name `
+                -ResourceGroupName $vm.resourceGroup `
+                -Force `
+                -NoWait
+
+            Write-Host "🟩 Shutdown initiated: $logCtx"
+        }
+        catch {
+            $functionName = $MyInvocation.MyCommand.Name
+            $errorMessage = "Error shutting down VM in function '$functionName': $logCtx – $($_.Exception.Message)"
+            Write-Host "Error shutting down VM. $($_.Exception.Message)"
+            Email-Alert -FunctionName $functionName -ErrorMessage $errorMessage
+            # Don't throw – continue to next VM
+        }
     }
 
-    $emailBody    = $reportLines -join "`n"
-    $functionName = $MyInvocation.MyCommand.Name
-
-    Email-Alert -FunctionName $functionName -ErrorMessage $emailBody
-
-    Write-Host "✅ Alert sent for $($failedFunctions.Count) failed function(s)." -ForegroundColor Green
+    Write-Host "🟩 Done. All non-compliant cattle VMs processed." -ForegroundColor Green
 
 } else {
-    Write-Host "✅ All functions healthy. No failures in last 24hrs." -ForegroundColor Green
+    $functionName = $MyInvocation.MyCommand.Name
+    $errorMessage = "Non-compliant cattle VM list is empty and returned 0 results. Nothing shut down. Function '$functionName'"
+    Write-Host "⚠ No non-compliant VMs found. Nothing to shut down." -ForegroundColor Yellow
+    Email-Alert -FunctionName $functionName -ErrorMessage $errorMessage
 }
+#>
