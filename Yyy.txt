@@ -1,102 +1,25 @@
-param($Timer)
+Hi Siddharth,
 
-Import-Module AutomationModules/acst.az.autohelper
-$currentUTCtime = (Get-Date).ToUniversalTime()
-Write-Host "PowerShell timer trigger function ran! TIME: $currentUTCtime"
+Hope you are doing well.
 
-$password = ConvertTo-SecureString $env:application_secret -AsPlainText -Force
-$TenantId = $env:tenant_id
-$ApplicationId = $env:application_id
-$Credential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $ApplicationId, $password
-Disable-AzContextAutosave -Scope Process
-try {
-    Connect-AzAccount -ServicePrincipal -TenantId $TenantId -Subscription hsbc-multi-cstmg-01 -Credential $Credential
-}
-catch {
-    Write-Host "Error connecting to Azure. $_.Exception"
-    throw $_.Exception
-}
+As advised in the previous HR case, I had my follow-up consultation with my treating doctor on 27 June 2026. Based on the latest medical assessment, I kindly request your support in raising a fresh HR case for an extension of my Work From Home arrangement. Please find the latest prescription attached for your reference.
 
-#KQL Query
-$KqlQuery = @"
-resources
-| where type =~ 'Microsoft.Compute/virtualMachines'
-| where tags['Production'] =~ 'No'
-| where tags['VM Type'] =~ 'Cattle'
-| where tags['cattleAgeCompliance'] =~ 'Non-Compliant'
-| where tags['VM Role'] != 'Appliance'
-| where isempty(tags['DatabricksEnvironment'])
-    and isempty(tags['databricks-environment'])
-    and (isempty(tags['aks-managed-orchestrator']) or tags['aks-managed-orchestrator'] !startswith 'Kubernetes')
-    and (isempty(tags['Vendor']) or tags['Vendor'] !contains 'Databricks')
-| project id, name, resourceGroup, subscriptionId, location
-"@
+The doctor has advised that although the surgery was successfully performed on 16 May 2026, the post-operative healing process is expected to take approximately three months, and I am currently only halfway through this recovery period. The following medical advice has been provided as part of my ongoing treatment:
 
-#Query Resource Graph
-Write-Host "Querying Resource Graph for non-compliant cattle VMs..."
+* Avoid direct sunlight: The scar is still in its active healing phase, and the newly healed skin is highly susceptible to hyperpigmentation. The doctor also explained that if the scar develops into a hypertrophic scar during the healing process, further treatment in the form of injections may be required. Avoiding direct sunlight and following the prescribed post-operative care are therefore essential to achieving the intended healing outcome.
+* Regular medical supervision: The healing scar requires periodic review, as inflammation or changes in the nature of the scar may develop during the recovery process. Based on its progress, further treatment may be required. I have therefore been advised to remain under regular follow-up with my treating doctor so that, if any such changes occur, they can be assessed promptly and appropriate treatment can be initiated without delay.
+* Post-operative scar therapy (Silicone Sheet Application): The doctor has advised consistent use of a silicone sheet as an essential part of my scar management. For the treatment to be effective, the silicone sheet needs to remain firmly secured against the scar with adequate pressure for prolonged periods on a daily basis. Since the scar is located vertically on my chin, the silicone sheet cannot remain in place on its own and has to be secured using a bandage wrapped around my head. As this therapy needs to be followed consistently every day during this critical healing period, maintaining the prescribed treatment while travelling to and attending the office would not be practically feasible and may compromise the intended healing outcome. A temporary Work From Home arrangement would enable me to adhere to the prescribed treatment while continuing to perform my work responsibilities without interruption.
 
-try {
-    $vmList = Search-AzGraph -Query $KqlQuery -First 1000
-}
-catch {
-    $functionName = $MyInvocation.MyCommand.Name
-    $errorMessage = "Error querying Resource Graph in function '$functionName': $($_.Exception.Message)"
-    Write-Host "Error querying Resource Graph. $($_.Exception.Message)"
-    Email-Alert -FunctionName $functionName -ErrorMessage $errorMessage
-    throw $_.Exception
-}
+As my treating doctor is based in my hometown and is actively supervising my recovery, remaining here during this critical healing phase also ensures that I can promptly consult him and receive timely treatment, should any complications or changes in the scar require immediate medical attention.
 
-Write-Host "Fetched $(@($vmList).Count) non-compliant VM(s)"
+As I have already completed nearly half of the prescribed recovery period, I am requesting this extension only for the remaining medically advised healing duration, approximately until mid-August, subject to HR’s approval.
 
-#VM List data print
-Foreach ($vm in $vmList) {
-    Write-Host "VM Name: $($vm.name), Resource Group: $($vm.resourceGroup), Subscription ID: $($vm.subscriptionId), Location: $($vm.location)"
-}
+I remain fully committed to my responsibilities and will continue to ensure that my work is delivered without any disruption. This request is not due to any limitation in my ability to work, but solely to enable me to comply with the prescribed post-operative treatment during this critical phase of recovery.
 
-#Shutdown Loop
-if ($vmList.Count -gt 0) {
+I would be grateful if you could kindly raise a fresh HR case based on the updated medical advice.
 
-    foreach ($vm in $vmList) {
-        $logCtx = "VM=[$($vm.name)] RG=[$($vm.resourceGroup)] Sub=[$($vm.subscriptionId)]"
-        Write-Host "Processing: $logCtx"
+Thank you very much for your continued support and assistance.
 
-        # Switch context to VM's subscription to fetch power state
-        Set-AzContext -SubscriptionId $vm.subscriptionId | Out-Null
+Kind regards,
 
-        # Check power state - only proceed if VM is running
-        $powerState = (Get-AzVM -ResourceGroupName $vm.resourceGroup -Name $vm.name -Status).Statuses |
-                      Where-Object { $_.Code -like 'PowerState/*' } |
-                      Select-Object -ExpandProperty Code
-
-        if ($powerState -ne 'PowerState/running') {
-            Write-Host "⏭ VM not running (current state: $powerState), skipping: $logCtx"
-            continue
-        }
-
-        try {
-            Stop-AzVM `
-                -Name              $vm.name `
-                -ResourceGroupName $vm.resourceGroup `
-                -Force `
-                -NoWait
-
-            Write-Host "🟩 Shutdown initiated: $logCtx"
-        }
-        catch {
-            $functionName = $MyInvocation.MyCommand.Name
-            $errorMessage = "Error shutting down VM in function '$functionName': $logCtx – $($_.Exception.Message)"
-            Write-Host "Error shutting down VM. $($_.Exception.Message)"
-            Email-Alert -FunctionName $functionName -ErrorMessage $errorMessage
-            # Don't throw – continue to next VM
-        }
-    }
-
-    Write-Host "🟩 Done. All non-compliant cattle VMs processed." -ForegroundColor Green
-
-} else {
-    $functionName = $MyInvocation.MyCommand.Name
-    $errorMessage = "Non-compliant cattle VM list is empty and returned 0 results. Nothing shut down. Function '$functionName'"
-    Write-Host "⚠ No non-compliant VMs found. Nothing to shut down." -ForegroundColor Yellow
-    Email-Alert -FunctionName $functionName -ErrorMessage $errorMessage
-}
-#>
+Aditya Koul
