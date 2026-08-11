@@ -1,27 +1,33 @@
-Hi Siddharth,
+foreach ($vm in $vmList) {
+    $logCtx = "VM=[$($vm.name)] RG=[$($vm.resourceGroup)] Sub=[$($vm.subscriptionId)]"
+    Write-Host "Processing: $logCtx"
 
-Hope you’re doing well.
+    $vmctx = Set-AzContext -SubscriptionId $vm.subscriptionId
 
-As advised in the previous HR case, I had my follow-up consultation with my treating doctor on 27 June 2026. Based on the latest medical assessment, I would like to request your support in raising a fresh HR case for an extension of my Work From Home arrangement till mid of August.
+    $powerState = $null
+    try {
+        $powerState = (Get-AzVM -ResourceGroupName $vm.resourceGroup -Name $vm.name -Status -DefaultProfile $vmctx -ErrorAction Stop).Statuses |
+            Where-Object { $_.Code -like 'PowerState/*' } |
+            Select-Object -ExpandProperty Code
+    }
+    catch {
+        Write-Host "⏭ Skipping (VM/RG no longer exists): $logCtx"
+        continue
+    }
 
-I’ve attached the latest prescription for your reference.
+    if ($powerState -ne 'PowerState/running') {
+        Write-Host "» VM not running (current state: $powerState), skipping: $logCtx"
+        continue
+    }
 
-Although my surgery on 16 May 2026 was successful, my doctor has advised that the overall recovery and scar healing process will take around three months, and I am currently about halfway through that period. As part of my ongoing treatment, I have been advised to:
-
-* Avoid direct sunlight: The scar is still healing, and the new skin is highly prone to hyperpigmentation. My doctor also explained that if the scar becomes hypertrophic during the healing process, it may require further treatment in the form of injections. Avoiding direct sunlight and following the prescribed post-operative care are therefore important for proper healing.
-* Continue regular follow-ups: The scar needs to be monitored periodically, as inflammation or other changes can develop during recovery. Depending on its progress, additional treatment may be required, so my doctor has advised me to remain under regular medical supervision.
-* Continue silicone sheet therapy: I have been advised to wear a silicone sheet consistently as part of my scar treatment. Since the scar is vertical on my chin, the sheet has to be be held in place with a bandage wrapped around my head so that it maintains adequate pressure for extended periods each day. Following this treatment consistently while commuting to and attending the office would be challenging and may affect the healing process. A temporary Work From Home arrangement would allow me to continue the prescribed treatment while carrying out my work without interruption.
-
-As my treating doctor is based in my hometown and is closely monitoring my recovery, staying here also ensures I can consult him promptly if there are any changes that require immediate attention.
-
-Since I have already completed nearly half of the prescribed recovery period, I am requesting this extension only for the remaining medically advised duration, approximately until mid-August, subject to HR’s approval.
-
-I remain fully committed to my responsibilities and will continue to ensure there is no disruption to my work. This request is not because of any limitation in my ability to work, but simply to help me follow the prescribed post-operative treatment during this important phase of recovery.
-
-I would be grateful if you could kindly raise a fresh HR case based on the updated medical advice.
-
-Thank you very much for your continued support.
-
-Kind regards,
-
-Aditya Koul
+    try {
+        # Stop-AzVM block here
+        Write-Host "✅ Shutdown initiated: $logCtx"
+    }
+    catch {
+        $functionName = $MyInvocation.MyCommand.Name
+        $errorMessage = "Error shutting down VM in function '$functionName': $logCtx | $($_.Exception.Message)"
+        Write-Host "Error shutting down VM. $($_.Exception.Message)"
+        Email-Alert -FunctionName $functionName -ErrorMessage $errorMessage
+    }
+}
