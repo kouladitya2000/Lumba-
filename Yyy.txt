@@ -1,52 +1,8 @@
-Subject: Request — Custom RBAC role to replace Website Contributor for Function App Invocations viewing
-
-Hi team,
-
-Context:
-I was unable to view the Invocations tab on a production Function App — the portal showed "This feature requires write permission to your app." Granting Website Contributor (Microsoft.Web/sites/*) fixed it, but that role grants far more than needed (full site config write, deploy, cert/domain management, etc.) for what should be a read-only viewing need.
-
-Note: this exact error message has also been reported as a known Azure portal bug in the past (Microsoft confirmed and hotfixed a case where users with Owner/Contributor still hit this message due to a backend permission-check bug). So it's possible this isn't a pure RBAC gap. I've already tried a hard refresh / retry and it did not resolve on its own, so I'd like to proceed with testing a scoped custom role rather than keeping Website Contributor.
-
-Request:
-Please create the following custom role and assign it to me on the specific production Function App, in addition to (not replacing) my current Website Contributor assignment:
-
-{
-  "Name": "Function App Invocation Viewer",
-  "IsCustom": true,
-  "Description": "Allows viewing Function App invocations in the Azure Portal.",
   "Actions": [
     "Microsoft.Web/sites/read",
     "Microsoft.Web/sites/functions/read",
     "Microsoft.Web/sites/config/read",
-    "Microsoft.Web/sites/config/list/action"
+    "Microsoft.Web/sites/config/list/action",
+    "Microsoft.Insights/components/read",
+    "Microsoft.Insights/components/query/action"
   ],
-  "NotActions": [],
-  "DataActions": [],
-  "NotDataActions": [],
-  "AssignableScopes": [
-    "/subscriptions/<SUBSCRIPTION-ID>/resourceGroups/<RESOURCE-GROUP>/providers/Microsoft.Web/sites/<FUNCTION-APP-NAME>"
-  ]
-}
-
-(Please fill in the actual subscription ID, resource group, and Function App name — scoped to that single app, not the whole subscription.)
-
-Important security note — please log this accurately:
-Microsoft.Web/sites/config/list/action is NOT a plain read-only action. Microsoft documents it as returning security-sensitive data, including the app's publishing credentials (FTP/deployment username+password) and function host/master keys. Anyone with this permission can retrieve those credentials via the ARM API response and use them to deploy code or invoke functions directly, bypassing normal CI/CD and RBAC.
-
-So please don't record this as "read-only invocation access" in the access log/audit trail — the accurate description is:
-"Custom role scoped to a single Function App, includes Microsoft.Web/sites/config/list/action, which exposes publishing credentials and function keys. Used solely to enable the Azure Portal's Invocations UI."
-
-This is still a major reduction from Microsoft.Web/sites/* (near-total site management surface) down to 4 specific read/list actions, scoped to one app instead of the whole subscription — but it isn't zero-risk and shouldn't be documented as such.
-
-Test plan:
-1. Create the role and assign it to me on the Function App (alongside my existing Website Contributor, not replacing it yet).
-2. I'll verify the Invocations blade loads correctly with just this role.
-3. Once confirmed, please remove my Website Contributor assignment on this app.
-4. If it does NOT work, I'll capture the exact denied action from the browser Network tab / portal error and send it back rather than requesting broader permissions blindly.
-
-Alternative if this role is judged too sensitive:
-If config/list/action isn't acceptable at any scope, an alternative is viewing invocation/execution data directly through Application Insights (Logs / Live Metrics) with just Monitoring Reader + Microsoft.Insights/components/read — this avoids touching site config or credentials entirely, but means using App Insights queries instead of the Functions Invocations UI.
-
-Let me know if you need anything else to process this.
-
-Thanks!
