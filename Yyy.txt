@@ -1,27 +1,10 @@
-# ===== Variables - update these =====
-$subscriptionId    = "<your-subscription-id>"
-$resourceGroupName = "<your-resource-group-name>"
-$storageAccountName = "nonprodlogs"  # or whatever the storage account is called
-
-# ===== Connect to Azure =====
-Connect-AzAccount
-
-# Set the correct subscription context
-Set-AzContext -SubscriptionId $subscriptionId
-
-# ===== Get your own user object ID =====
-$currentUser = Get-AzADUser -SignedIn
-$userObjectId = $currentUser.Id
-Write-Host "Assigning role to user: $($currentUser.UserPrincipalName) ($userObjectId)"
-
-# ===== Get the storage account resource ID =====
-$storageAccount = Get-AzStorageAccount -ResourceGroupName $resourceGroupName -Name $storageAccountName
-$scope = $storageAccount.Id
-
-# ===== Assign the role =====
-New-AzRoleAssignment `
-    -ObjectId $userObjectId `
-    -RoleDefinitionName "Storage Blob Data Reader" `
-    -Scope $scope
-
-Write-Host "Role assignment complete. It may take a few minutes to propagate."
+AzureActivity
+| where TimeGenerated > ago(365d)
+| where SubscriptionId == "<your-sub-id>"
+| where OperationNameValue has "TAGS"
+| where ResourceId !has "/resourceGroups/"
+| extend Props = parse_json(Properties)
+| project TimeGenerated, Caller, CallerIpAddress, OperationNameValue,
+          ActivityStatusValue, ResourceId,
+          RequestBody = Props.requestbody, ResponseBody = Props.responseBody
+| order by TimeGenerated desc
