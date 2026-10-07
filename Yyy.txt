@@ -1,86 +1,23 @@
-$ErrorActionPreference = "Stop"
-$desk     = "$env:USERPROFILE\Desktop"
-$src      = Join-Path $desk "2026_CustomerVerifiedTags.xlsx"
-$template = Join-Path $desk "ITSO_Template.xlsx"
-$outDir   = Join-Path $desk "ITSOwiseExcel"
-
-if (-not (Test-Path $src))      { throw "Source not found: $src" }
-if (-not (Test-Path $template)) { throw "Template not found: $template" }
-if (-not (Test-Path $outDir))   { [void](New-Item -ItemType Directory -Path $outDir) }
-
+$outDir = "$env:USERPROFILE\Desktop\ITSOwiseExcel"
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false
-$ok = 0; $fail = 0
+$total = 0; $files = 0
 
 try {
-    $wb   = $excel.Workbooks.Open($src)
-    $ws   = $wb.Worksheets.Item("Sheet1")
-    $last = $ws.Cells.Item($ws.Rows.Count, 1).End(-4162).Row
-    $data = $ws.Range("A2:G$last").Value2
-    $wb.Close($false)
-
-    $groups = @{}
-    $order  = New-Object System.Collections.ArrayList
-    for ($i = 1; $i -le ($last - 1); $i++) {
-        $itso = ("" + $data[$i,2]).Trim()
-        if ($itso -eq "") { continue }
-        $key = $itso.ToLower()
-        if (-not $groups.ContainsKey($key)) {
-            $groups[$key] = New-Object System.Collections.ArrayList
-            [void]$order.Add($key)
-        }
-        [void]$groups[$key].Add($i)
+    Get-ChildItem $outDir -Filter *.xlsx | ForEach-Object {
+        $wb   = $excel.Workbooks.Open($_.FullName, 0, $true)
+        $ws   = $wb.Worksheets.Item(1)
+        $last = $ws.Cells.Item($ws.Rows.Count, 2).End(-4162).Row
+        $cnt  = $last - 1
+        $total += $cnt; $files++
+        Write-Host ("{0,-50} {1}" -f $_.Name, $cnt)
+        $wb.Close($false)
     }
-    Write-Host "ITSOs found: $($order.Count)"
-
-    foreach ($key in $order) {
-        $nb = $null
-        try {
-            $rows = $groups[$key]
-            $n    = $rows.Count
-            $arr  = New-Object 'object[,]' ($n + 1), 6
-            $arr[0,0]="ITSO"; $arr[0,1]="SUBSCRIPTION NAME"; $arr[0,2]="ITSO DELEGATE"
-            $arr[0,3]="EIM";  $arr[0,4]="EHC ID";            $arr[0,5]="BA ID"
-            for ($r = 0; $r -lt $n; $r++) {
-                $i = $rows[$r]
-                $arr[($r+1),0] = $key
-                $arr[($r+1),1] = $data[$i,1]
-                $arr[($r+1),2] = $data[$i,3]
-                $arr[($r+1),3] = $data[$i,5]
-                $arr[($r+1),4] = $data[$i,6]
-                $arr[($r+1),5] = $data[$i,7]
-            }
-
-            $safe = ($key -replace '[\\/:*?"<>|]', '_')
-            $file = Join-Path $outDir ($safe + ".xlsx")
-            Copy-Item $template $file -Force
-
-            $nb = $excel.Workbooks.Open($file)
-            $s  = $nb.Worksheets.Item(1)
-            $s.Range($s.Cells.Item(1,1), $s.Cells.Item($n+1,6)).Value2 = $arr
-            $s.Rows.Item(1).Font.Bold = $true
-            [void]$s.Columns.AutoFit()
-            $nb.Save()
-            $nb.Close($false)
-            $nb = $null
-
-            $ok++; Write-Host "Saved: $safe.xlsx"
-        }
-        catch {
-            $fail++
-            Write-Host "FAILED for $key : $($_.Exception.Message)" -ForegroundColor Red
-            if ($nb -ne $null) { try { $nb.Close($false) } catch {} }
-        }
-    }
-}
-catch {
-    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
 }
 finally {
     $excel.Quit()
     [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel)
 }
 
-$onDisk = @(Get-ChildItem $outDir -Filter *.xlsx).Count
-Write-Host "Saved OK: $ok | Failed: $fail | Files on disk: $onDisk" -ForegroundColor Cyan
+Write-Host "Files: $files | Total subscriptions: $total" -ForegroundColor Cyan
