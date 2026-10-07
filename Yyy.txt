@@ -1,13 +1,12 @@
 $ErrorActionPreference = "Stop"
+$desk     = "$env:USERPROFILE\Desktop"
+$src      = Join-Path $desk "2026_CustomerVerifiedTags.xlsx"
+$template = Join-Path $desk "ITSO_Template.xlsx"
+$outDir   = Join-Path $desk "ITSOwiseExcel"
 
-$srcName = "YourFile.xlsx"                         # file name on your Desktop
-$src     = Join-Path "$env:USERPROFILE\Desktop" $srcName
-$outDir  = Join-Path "$env:USERPROFILE\Desktop" "ITSOwiseExcel"
-
-if (-not (Test-Path $src)) { throw "Source file not found: $src" }
-if (-not (Test-Path $outDir)) { [void](New-Item -ItemType Directory -Path $outDir) }
-Write-Host "Source: $src"
-Write-Host "Output: $outDir"
+if (-not (Test-Path $src))      { throw "Source not found: $src" }
+if (-not (Test-Path $template)) { throw "Template not found: $template" }
+if (-not (Test-Path $outDir))   { [void](New-Item -ItemType Directory -Path $outDir) }
 
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
@@ -18,12 +17,11 @@ try {
     $wb   = $excel.Workbooks.Open($src)
     $ws   = $wb.Worksheets.Item("Sheet1")
     $last = $ws.Cells.Item($ws.Rows.Count, 1).End(-4162).Row
-    Write-Host "Last row: $last"
+    $data = $ws.Range("A2:G$last").Value2
+    $wb.Close($false)
 
-    $data   = $ws.Range("A2:G$last").Value2
     $groups = @{}
     $order  = New-Object System.Collections.ArrayList
-
     for ($i = 1; $i -le ($last - 1); $i++) {
         $itso = ("" + $data[$i,2]).Trim()
         if ($itso -eq "") { continue }
@@ -54,21 +52,20 @@ try {
                 $arr[($r+1),5] = $data[$i,7]
             }
 
-            $nb = $excel.Workbooks.Add()
+            $safe = ($key -replace '[\\/:*?"<>|]', '_')
+            $file = Join-Path $outDir ($safe + ".xlsx")
+            Copy-Item $template $file -Force
+
+            $nb = $excel.Workbooks.Open($file)
             $s  = $nb.Worksheets.Item(1)
             $s.Range($s.Cells.Item(1,1), $s.Cells.Item($n+1,6)).Value2 = $arr
             $s.Rows.Item(1).Font.Bold = $true
             [void]$s.Columns.AutoFit()
-
-            $safe = ($key -replace '[\\/:*?"<>|]', '_')
-            $file = Join-Path $outDir ($safe + ".xlsx")
-            if (Test-Path $file) { Remove-Item $file -Force }
-            $nb.SaveAs($file, 51)
+            $nb.Save()
             $nb.Close($false)
             $nb = $null
 
-            if (Test-Path $file) { $ok++; Write-Host "Saved: $safe.xlsx" }
-            else { $fail++; Write-Host "NOT FOUND after save: $file" -ForegroundColor Red }
+            $ok++; Write-Host "Saved: $safe.xlsx"
         }
         catch {
             $fail++
@@ -76,7 +73,6 @@ try {
             if ($nb -ne $null) { try { $nb.Close($false) } catch {} }
         }
     }
-    $wb.Close($false)
 }
 catch {
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
@@ -86,6 +82,5 @@ finally {
     [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel)
 }
 
-$onDisk = @(Get-ChildItem $outDir -Filter *.xlsx -ErrorAction SilentlyContinue).Count
-Write-Host "Saved OK: $ok | Failed: $fail | Files actually on disk: $onDisk" -ForegroundColor Cyan
-Write-Host "Open this folder to check: $outDir"
+$onDisk = @(Get-ChildItem $outDir -Filter *.xlsx).Count
+Write-Host "Saved OK: $ok | Failed: $fail | Files on disk: $onDisk" -ForegroundColor Cyan
