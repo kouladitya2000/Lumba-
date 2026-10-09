@@ -1,10 +1,459 @@
-$p = "C:\Temp\savetest.xlsx"
-New-Item -ItemType Directory -Path C:\Temp -Force | Out-Null
-$xl = New-Object -ComObject Excel.Application
-$xl.DisplayAlerts = $false
-$wb = $xl.Workbooks.Add()
-$wb.SaveAs($p, 51)
-"Excel says path : $($wb.FullName)"
-"Test-Path       : $(Test-Path $p)"
-$wb.Close($false); $xl.Quit()
-[Environment]::Is64BitProcess
+<#
+.SYNOPSIS
+  Builds a NEW Excel report of subscription tags.
+
+  INPUT : an Excel file with subscription name (column A) and/or subscription ID (column B).
+  OUTPUT: a new .xlsx with columns
+            SubscriptionName | SubscriptionId | BA ID | EIM | EHC ID
+          (the last three are the live Azure subscription tags).
+
+  The report is saved with the sensitivity label "Internal" (see SENSITIVITY LABEL below).
+
+  Logging: everything prints on screen (no log file). At the end you get ONE summary
+  that lists every subscription missing any of the three tags, plus any subscription
+  that could not be read.
+
+.READ-ONLY GUARANTEE
+  - Azure   : only reads (Get-AzSubscription, Get-AzTag). Nothing in Azure is changed.
+  - Input   : the input workbook is only read, never saved or edited.
+  - The ONLY file written is the new report .xlsx (never overwrites an existing file).
+
+.PREREQUISITES
+  - Microsoft Excel installed (used to read the input and write the report; no extra modules).
+  - Install-Module Az.Accounts, Az.Resources -Scope CurrentUser
+  - Connect-AzAccount
+
+.SENSITIVITY LABEL
+  Your organisation requires the status "Internal" on every saved file. Excel will not save
+  until a label is chosen, and a hidden Excel cannot show that prompt (SaveAs then silently
+  does nothing). So the report workbook is opened VISIBLE.
+
+  Option 1 (easiest): run as is. If Excel shows a sensitivity prompt, click "Internal".
+  Option 2 (automatic): pass -LabelId and -TenantId.
+      Open any file already marked Internal, then run:
+        $xl = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application")
+        $xl.ActiveWorkbook.SensitivityLabel.GetLabel() | Format-List *
+      Use LabelId for -LabelId and SiteId for -TenantId.
+
+.USAGE
+  1. Set $InputExcelPath below (or pass -InputExcelPath).
+  2. Run the script. The report is saved next to the input file unless you set -OutputPath.
+
+  Name only / ID only rows are fine: a missing ID is looked up from the name,
+  and a missing name is filled in from the ID.
+
+  If your input sheet has an active filter (e.g. "251 of 254 records found"), hidden rows are
+  INCLUDED by default. Add -VisibleRowsOnly to process only the rows you can see.
+#>
+
+[CmdletBinding()]
+param(
+    # >>> SET YOUR INPUT FILE PATH HERE <<<
+    [string]$InputExcelPath = "C:\Users\45270978\Desktop\TagsValidator\Stage2Helper.xlsx",
+    [string]$SheetName      = "Sheet1",
+    [string]$NameHeader     = "SubscriptionName",
+    [string]$IdHeader       = "SubscriptionId",
+
+    # Leave blank to save next to the input file as Stage2SubscriptionTagsReportEHCValidateHelper_<timestamp>.xlsx
+    [string]$OutputPath     = "",
+
+    [switch]$VisibleRowsOnly,
+    [int]$MaxRetries        = 3,
+
+    # Sensitivity label (optional - leave blank to pick "Internal" manually when Excel prompts)
+    [string]$LabelId        = "",
+    [string]$TenantId       = "",
+    [string]$LabelName      = "Internal"
+)
+
+$ErrorActionPreference = "Stop"
+
+# Tags to collect (this order = column order in the report)
+$TagNames = @("BA ID", "EIM", "EHC ID")
+
+function Write-Log {
+    param([string]$Message, [string]$Color = "")
+    $line = "[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $Message
+    if ($Color) { Write-Host $line -ForegroundColor $Color } else { Write-Host $line }
+}
+function Write-Plain {
+    param([string]$Message = "", [string]$Color = "")
+    if ($Color) { Write-Host $Message -ForegroundColor $Color } else { Write-Host $Message }
+}
+
+# ---------- Pre-flight ----------
+if (-not (Get-Module -ListAvailable -Name Az.Resources)) {
+    throw "Az.Resources module not found. Run: Install-Module Az.Accounts, Az.Resources -Scope CurrentUser"
+}
+if (-not (Get-AzContext)) { throw "Not signed in to Azure. Run Connect-AzAccount first." }
+if (-not (Test-Path -LiteralPath $InputExcelPath)) {
+    throw "Input file not found: $InputExcelPath  (set the correct path at the top of the script)"
+}
+$fullInput = (Resolve-Path -LiteralPath $InputExcelPath).Path
+
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+if (-not $OutputPath) {
+    $OutputPath = Join-Path (Split-Path -Parent $fullInput) "Stage2SubscriptionTagsReportEHCValidateHelper_$stamp.xlsx"
+}
+if ([IO.Path]::GetExtension($OutputPath).ToLower() -ne ".xlsx") { throw "-OutputPath must end with .xlsx" }
+$outDir = Split-Path -Parent $OutputPath
+if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { throw "Output folder does not exist: $outDir" }
+if (Test-Path -LiteralPath $OutputPath) { throw "Output file already exists (not overwriting): $OutputPath" }
+
+# ---------- Excel helpers ----------
+function ConvertTo-CellString($v) {
+    if ($null -eq $v) { return "" }
+    if ($v -is [double]) { return $v.ToString("0.##########", [Globalization.CultureInfo]::InvariantCulture) }
+    return [string]$v
+}
+
+function Read-InputSheet {
+    # Reads the sheet read-only. Returns the cell values and which data rows are hidden by a filter.
+    param([string]$FullPath, [string]$Sheet)
+
+    $excel = $null; $wb = $null; $ws = $null; $ur = $null
+    $own = $false; $running = $null; $data = $null; $hidden = @{}
+
+    try { $running = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application") } catch { $running = $null }
+    if ($running) {
+        foreach ($w in $running.Workbooks) {
+            if ($w.FullName -ieq $FullPath) { $wb = $w; $excel = $running; break }
+        }
+    }
+
+    try {
+        if (-not $wb) {
+            $excel = New-Object -ComObject Excel.Application
+            $excel.Visible = $false
+            $excel.DisplayAlerts = $false
+            $own = $true
+            $wb = $excel.Workbooks.Open($FullPath, 0, $true)      # UpdateLinks=0, ReadOnly=true
+        }
+        $ws = if ($Sheet) { $wb.Worksheets.Item($Sheet) } else { $wb.Worksheets.Item(1) }
+        $ur = $ws.UsedRange
+        $data = $ur.Value2
+        $firstRow = [int]$ur.Row
+        if ($data -is [object[,]]) {
+            $n = $data.GetLength(0)
+            for ($k = 2; $k -le $n; $k++) {
+                if ([bool]$ws.Rows.Item($firstRow + $k - 1).Hidden) { $hidden[$k] = $true }
+            }
+        }
+    }
+    catch {
+        throw "Could not read sheet '$Sheet' from '$FullPath'. If the file is open, make sure no cell is in edit mode. $($_.Exception.Message)"
+    }
+    finally {
+        if ($ur) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ur) }
+        if ($ws) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ws) }
+        if ($own) {
+            if ($wb)    { try { $wb.Close($false) } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wb) }
+            if ($excel) { try { $excel.Quit() } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
+        }
+    }
+    return @{ Data = $data; Hidden = $hidden }
+}
+
+# ---------- Read the input list ----------
+Write-Log "Starting subscription tag report (Azure access is read-only)"
+Write-Log "Reading input list: $fullInput"
+$in   = Read-InputSheet -FullPath $fullInput -Sheet $SheetName
+$data = $in.Data
+if ($data -isnot [object[,]]) { throw "The input sheet is empty." }
+
+$col = @{}
+for ($c = 1; $c -le $data.GetLength(1); $c++) {
+    $h = (ConvertTo-CellString $data[1, $c]).Trim()
+    if ($h -and -not $col.ContainsKey($h)) { $col[$h] = $c }
+}
+foreach ($h in @($NameHeader, $IdHeader)) {
+    if (-not $col.ContainsKey($h)) { throw "Header '$h' not found in row 1. Headers found: $($col.Keys -join ', ')" }
+}
+
+$inputRows   = New-Object System.Collections.Generic.List[object]
+$hiddenCount = 0
+$skippedHidden = 0
+for ($r = 2; $r -le $data.GetLength(0); $r++) {
+    $n  = (ConvertTo-CellString $data[$r, $col[$NameHeader]]).Trim()
+    $id = (ConvertTo-CellString $data[$r, $col[$IdHeader]]).Trim()
+    if (-not $n -and -not $id) { continue }
+    $isHidden = $in.Hidden.ContainsKey($r)
+    if ($isHidden) { $hiddenCount++ }
+    if ($isHidden -and $VisibleRowsOnly) { $skippedHidden++; continue }
+    $inputRows.Add([pscustomobject]@{ Row = $r; Name = $n; Id = $id })
+}
+if ($inputRows.Count -eq 0) { throw "No subscription rows found in the input sheet." }
+
+Write-Log "Input rows to process: $($inputRows.Count)"
+if ($hiddenCount -gt 0) {
+    if ($VisibleRowsOnly) { Write-Log "NOTE: $hiddenCount row(s) are hidden by a filter and were SKIPPED (-VisibleRowsOnly)." "Yellow" }
+    else { Write-Log "NOTE: $hiddenCount row(s) are hidden by a filter and are INCLUDED. Use -VisibleRowsOnly to skip them." "Yellow" }
+}
+
+$dupes = $inputRows | Where-Object { $_.Id } | Group-Object { $_.Id.ToLower() } | Where-Object Count -gt 1
+foreach ($d in $dupes) { Write-Log "WARNING: duplicate subscription ID in input: $($d.Name) ($($d.Count) rows)" "Yellow" }
+
+# ---------- Azure subscription lookup (read-only) ----------
+$subById = @{}; $subByName = @{}
+try {
+    foreach ($s in @(Get-AzSubscription -ErrorAction Stop)) {
+        $subById[$s.Id.ToLower()] = $s
+        $k = $s.Name.ToLower()
+        if (-not $subByName.ContainsKey($k)) { $subByName[$k] = New-Object System.Collections.Generic.List[object] }
+        $subByName[$k].Add($s)
+    }
+    Write-Log "Accessible subscriptions found in Azure: $($subById.Count)"
+}
+catch {
+    Write-Log "WARNING: could not list subscriptions ($(($_.Exception.Message -split "`n")[0])). Rows with only a name cannot be resolved." "Yellow"
+}
+
+# ---------- Helpers ----------
+function Get-SubscriptionTags {
+    param([string]$SubId)
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            $t = Get-AzTag -ResourceId "/subscriptions/$SubId" -ErrorAction Stop
+            return $t.Properties.TagsProperty
+        }
+        catch {
+            $msg = $_.Exception.Message
+            if ($msg -match "AuthorizationFailed|SubscriptionNotFound|InvalidAuthenticationToken|not found|Forbidden|does not have authorization") { throw }
+            if ($attempt -eq $MaxRetries) { throw }
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
+}
+
+function Get-TagValue {
+    # Azure tag NAMES are case-insensitive
+    param($Tags, [string]$Name)
+    if (-not $Tags) { return @{ Exists = $false; Value = "" } }
+    foreach ($k in $Tags.Keys) {
+        if ($k -ieq $Name) { return @{ Exists = $true; Value = "$($Tags[$k])" } }
+    }
+    return @{ Exists = $false; Value = "" }
+}
+
+# ---------- Main loop ----------
+$results = New-Object System.Collections.Generic.List[object]
+$i = 0
+
+foreach ($row in $inputRows) {
+    $i++
+    $name = $row.Name; $id = $row.Id; $err = $null
+
+    Write-Progress -Activity "Reading subscription tags" -Status "$i of $($inputRows.Count): $name $id" -PercentComplete (($i / $inputRows.Count) * 100)
+
+    # Resolve ID from name / name from ID
+    if (-not $id) {
+        $m = $subByName[$name.ToLower()]
+        if (-not $m)               { $err = "Subscription name not found in accessible subscriptions (cannot resolve ID)." }
+        elseif ($m.Count -gt 1)    { $err = "Subscription name matches $($m.Count) subscriptions; add the subscription ID to the input." }
+        else                       { $id = $m[0].Id }
+    }
+    else {
+        $g = [guid]::Empty
+        if (-not [guid]::TryParse($id, [ref]$g)) { $err = "'$id' is not a valid subscription ID." }
+        elseif (-not $name -and $subById.ContainsKey($id.ToLower())) { $name = $subById[$id.ToLower()].Name }
+    }
+
+    $values  = @{}; foreach ($t in $TagNames) { $values[$t] = "" }
+    $missing = @()   # tags not set at all
+    $empty   = @()   # tags set but with an empty value
+
+    if (-not $err) {
+        try {
+            $tags = Get-SubscriptionTags -SubId $id
+            foreach ($t in $TagNames) {
+                $tv = Get-TagValue -Tags $tags -Name $t
+                $values[$t] = $tv.Value
+                if (-not $tv.Exists)              { $missing += $t }
+                elseif (-not $tv.Value.Trim())    { $empty   += $t }
+            }
+        }
+        catch { $err = ($_.Exception.Message -split "`n")[0].Trim() }
+    }
+
+    $status = if ($err) { "ERROR" } elseif ($missing.Count -or $empty.Count) { "TAGS_MISSING" } else { "ALL_TAGS_PRESENT" }
+
+    $results.Add([pscustomobject]@{
+        InputRow = $row.Row; Name = $name; Id = $id; Values = $values
+        Missing = $missing; Empty = $empty; Error = $err; Status = $status
+    })
+
+    switch ($status) {
+        "ALL_TAGS_PRESENT" { Write-Log "OK        $name ($id)" }
+        "TAGS_MISSING"     {
+            $parts = @(); foreach ($t in $missing) { $parts += "$t (not set)" }; foreach ($t in $empty) { $parts += "$t (empty)" }
+            Write-Log "MISSING   $name ($id) - $($parts -join ', ')" "Yellow"
+        }
+        "ERROR"            { Write-Log "ERROR     $name ($id) - $err" "Red" }
+    }
+}
+Write-Progress -Activity "Reading subscription tags" -Completed
+
+# ---------- Create the new Excel report ----------
+$saveError = $null
+$xl = $null; $wbOut = $null; $wsOut = $null
+try {
+    $rowsN  = $results.Count
+    $colsN  = 2 + $TagNames.Count
+    $arr    = New-Object 'object[,]' ($rowsN + 1), $colsN
+    $arr[0, 0] = "SubscriptionName"; $arr[0, 1] = "SubscriptionId"
+    for ($t = 0; $t -lt $TagNames.Count; $t++) { $arr[0, (2 + $t)] = $TagNames[$t] }
+    for ($r = 0; $r -lt $rowsN; $r++) {
+        $res = $results[$r]
+        $arr[($r + 1), 0] = $res.Name
+        $arr[($r + 1), 1] = $res.Id
+        for ($t = 0; $t -lt $TagNames.Count; $t++) { $arr[($r + 1), (2 + $t)] = $res.Values[$TagNames[$t]] }
+    }
+
+    # Excel must be VISIBLE with alerts ON so the sensitivity-label prompt can appear.
+    # (Hidden + DisplayAlerts=$false made SaveAs silently do nothing.)
+    $xl = New-Object -ComObject Excel.Application
+    $xl.Visible = $true
+    $xl.DisplayAlerts = $true
+    $wbOut = $xl.Workbooks.Add()
+    $wsOut = $wbOut.Worksheets.Item(1)
+    $wsOut.Name = "SubscriptionTags"
+
+    $rng = $wsOut.Range($wsOut.Cells.Item(1, 1), $wsOut.Cells.Item($rowsN + 1, $colsN))
+    $rng.NumberFormat = "@"          # keep every value as text (no number/leading-zero changes)
+    $rng.Value2 = $arr
+
+    # Header styling
+    $hdr = $wsOut.Range($wsOut.Cells.Item(1, 1), $wsOut.Cells.Item(1, $colsN))
+    $hdr.Font.Bold = $true
+    $hdr.Interior.Color = 15921906    # light grey
+
+    # Highlight: missing/empty tag cells = yellow, unreadable rows = light red
+    $yellow = 255 + (235 * 256) + (156 * 65536)
+    $red    = 255 + (199 * 256) + (206 * 65536)
+    for ($r = 0; $r -lt $rowsN; $r++) {
+        $res = $results[$r]; $xlRow = $r + 2
+        if ($res.Error) {
+            $wsOut.Range($wsOut.Cells.Item($xlRow, 1), $wsOut.Cells.Item($xlRow, $colsN)).Interior.Color = $red
+            continue
+        }
+        for ($t = 0; $t -lt $TagNames.Count; $t++) {
+            if ($res.Missing -contains $TagNames[$t] -or $res.Empty -contains $TagNames[$t]) {
+                $wsOut.Cells.Item($xlRow, (3 + $t)).Interior.Color = $yellow
+            }
+        }
+    }
+
+    try { [void]$wsOut.Range($wsOut.Cells.Item(1, 1), $wsOut.Cells.Item(1, $colsN)).AutoFilter() } catch {}
+    [void]$wsOut.Columns.AutoFit()
+
+    # ----- Sensitivity label: "Internal" -----
+    if ($LabelId -and $TenantId) {
+        try {
+            $sl   = $wbOut.SensitivityLabel
+            $info = $sl.CreateLabelInfo()
+            $info.LabelId          = $LabelId
+            $info.LabelName        = $LabelName
+            $info.SiteId           = $TenantId
+            $info.AssignmentMethod = 1      # privileged (user-set)
+            $info.IsEnabled        = $true
+            $sl.SetLabel($info, $info)
+            Write-Log "Sensitivity label '$LabelName' applied." "Green"
+        }
+        catch {
+            Write-Log "WARNING: could not set the label automatically: $($_.Exception.Message)" "Yellow"
+            Write-Log "If Excel shows a sensitivity prompt, choose '$LabelName' to continue." "Yellow"
+        }
+    }
+    else {
+        Write-Log "No label GUID given. If Excel shows a sensitivity prompt, choose '$LabelName' (the script waits)." "Yellow"
+    }
+
+    $wbOut.SaveAs($OutputPath, 51)    # 51 = .xlsx
+
+    # Do not trust SaveAs alone: confirm the file is really on disk
+    if (-not (Test-Path -LiteralPath $OutputPath)) {
+        throw "Excel reported the save as successful, but no file exists at: $OutputPath (Excel's own workbook name is now '$($wbOut.FullName)'; a missing sensitivity label, security software or a redirected/synced folder may have blocked it)."
+    }
+    $savedItem = Get-Item -LiteralPath $OutputPath
+    Write-Log "Report saved and verified on disk: $($savedItem.FullName)  ($([math]::Round($savedItem.Length / 1KB)) KB)" "Green"
+}
+catch {
+    $saveError = $_.Exception.Message
+    Write-Log "ERROR: report could not be saved. $saveError" "Red"
+}
+finally {
+    if ($wsOut) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wsOut) }
+    if ($wbOut) { try { $wbOut.Close($false) } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wbOut) }
+    if ($xl)    { try { $xl.Quit() } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($xl) }
+}
+
+# ---------- Final summary (everything together) ----------
+$total    = $results.Count
+$okAll    = @($results | Where-Object Status -eq "ALL_TAGS_PRESENT")
+$missingS = @($results | Where-Object Status -eq "TAGS_MISSING")
+$errorS   = @($results | Where-Object Status -eq "ERROR")
+$readable = $total - $errorS.Count
+
+Write-Plain ""
+Write-Plain ("=" * 78)
+Write-Plain "  SUBSCRIPTION TAG REPORT SUMMARY   (tags: $($TagNames -join ', '))"
+Write-Plain ("=" * 78)
+Write-Plain "  Run time                      : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Write-Plain "  Input file                    : $fullInput"
+Write-Plain "  Subscriptions processed       : $total"
+Write-Plain "  Having all 3 tags             : $($okAll.Count)"  "Green"
+Write-Plain "  Missing one or more tags      : $($missingS.Count)" $(if ($missingS.Count) { "Yellow" } else { "Green" })
+Write-Plain "  Could not be read (errors)    : $($errorS.Count)"   $(if ($errorS.Count)   { "Red" }    else { "Green" })
+if ($hiddenCount -gt 0) {
+    Write-Plain "  Rows hidden by input filter   : $hiddenCount ($(if ($VisibleRowsOnly) { 'skipped' } else { 'included' }))"
+}
+Write-Plain ("-" * 78)
+
+Write-Plain "  Tag coverage (of $readable readable subscriptions):"
+foreach ($t in $TagNames) {
+    $set = @($results | Where-Object { -not $_.Error -and ($_.Missing -notcontains $t) -and ($_.Empty -notcontains $t) }).Count
+    $notSet = @($results | Where-Object { -not $_.Error -and $_.Missing -contains $t }).Count
+    $emp    = @($results | Where-Object { -not $_.Error -and $_.Empty -contains $t }).Count
+    Write-Plain ("    {0,-8} present: {1,-5} not set: {2,-5} empty value: {3}" -f $t, $set, $notSet, $emp)
+}
+Write-Plain ("-" * 78)
+
+if ($total -gt 0 -and $okAll.Count -eq $total) {
+    Write-Plain "  RESULT: 100% - every subscription has all three tags (BA ID, EIM, EHC ID)." "Green"
+}
+else {
+    Write-Plain "  RESULT: NOT ALL SUBSCRIPTIONS HAVE ALL THREE TAGS - $($missingS.Count + $errorS.Count) need attention." "Red"
+
+    if ($missingS.Count -gt 0) {
+        Write-Plain ""
+        Write-Plain "  SUBSCRIPTIONS MISSING TAG(S) ($($missingS.Count)):" "Yellow"
+        foreach ($m in $missingS) {
+            Write-Plain ""
+            Write-Plain "  * $($m.Name)   (input row $($m.InputRow))"
+            Write-Plain "    ID      : $($m.Id)"
+            if ($m.Missing.Count) { Write-Plain "    Not set : $($m.Missing -join ', ')" }
+            if ($m.Empty.Count)   { Write-Plain "    Empty   : $($m.Empty -join ', ')" }
+            $have = @(); foreach ($t in $TagNames) { if ($m.Missing -notcontains $t -and $m.Empty -notcontains $t) { $have += "$t=$($m.Values[$t])" } }
+            Write-Plain "    Has     : $(if ($have.Count) { $have -join ',  ' } else { '(none of the three tags)' })"
+        }
+    }
+
+    if ($errorS.Count -gt 0) {
+        Write-Plain ""
+        Write-Plain "  COULD NOT BE READ ($($errorS.Count)) - check name/ID, access or tenant:" "Red"
+        foreach ($e in $errorS) {
+            Write-Plain "  * $($e.Name)   (input row $($e.InputRow))  [$($e.Id)]"
+            Write-Plain "    $($e.Error)"
+        }
+    }
+}
+
+Write-Plain ""
+Write-Plain ("-" * 78)
+if ($saveError) { Write-Plain "  REPORT FILE: NOT SAVED - $saveError" "Red" }
+else {
+    Write-Plain "  Report file : $OutputPath"
+    Write-Plain "  (yellow cells = tag not set or empty; light red rows = subscription could not be read)"
+}
+Write-Plain "  Azure: read-only. Input workbook untouched. No log file written."
+Write-Plain ("=" * 78)
