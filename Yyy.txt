@@ -1,104 +1,120 @@
 <#
 .SYNOPSIS
-  Verifies "BA ID" and "EIM" tag values in Stage1Analysis-TagsMapping.xlsx
-  against the live tags on each Azure subscription.
+  Validates the "BA ID" (column C) and "EIM" (column D) values in your OPEN
+  Excel workbook against the live tags on each Azure subscription
+  (column A = name, column B = subscription ID).
 
-.PREREQUISITES (run once)
-  Install-Module ImportExcel -Scope CurrentUser
-  Install-Module Az.Accounts, Az.Resources -Scope CurrentUser
-  Connect-AzAccount          # sign in to the tenant that owns the subscriptions
+  READ-ONLY and FILE-FREE:
+    - Reads the already-open workbook through Excel (nothing is saved, edited or closed).
+    - Reads tags from Azure with Get-AzTag (GET only).
+    - Writes NOTHING to disk. All logs and the final summary print on screen.
+
+.PREREQUISITES
+  - Use Windows PowerShell 5.1 (the blue "Windows PowerShell" window), not PowerShell 7.
+  - Run PowerShell and Excel at the same privilege level (both normal, not "as administrator").
+  - Az modules:  Install-Module Az.Accounts, Az.Resources -Scope CurrentUser
+  - Sign in:     Connect-AzAccount
+  - Open Stage1Analysis-TagsMapping.xlsx in Excel and make sure no cell is in edit mode.
 
 .USAGE
-  .\Verify-SubscriptionTags.ps1
-  .\Verify-SubscriptionTags.ps1 -ExcelPath "C:\path\Stage1Analysis-TagsMapping.xlsx"
-
-  Close the Excel file before running.
-
-.OUTPUT
-  Console summary at the end, plus in -OutputFolder:
-    TagVerification_<timestamp>_Full.csv        every subscription checked
-    TagVerification_<timestamp>_Mismatches.csv  only the problem subscriptions
-    TagVerification_<timestamp>.log             full log incl. the summary
+  .\Verify-SubscriptionTags-NoFiles.ps1
 #>
 
 [CmdletBinding()]
 param(
-    [string]$ExcelPath    = ".\Stage1Analysis-TagsMapping.xlsx",
+    [string]$WorkbookName = "Stage1Analysis-TagsMapping",
     [string]$SheetName    = "Sheet1",
-    [string]$OutputFolder = ".",
     [int]$MaxRetries      = 3
 )
 
 $ErrorActionPreference = "Stop"
 
-# Columns we care about: C = "BA ID", D = "EIM"
-$TagsToCheck = @(
-    @{ Tag = "BA ID"; Column = "BA ID" },
-    @{ Tag = "EIM";   Column = "EIM"   }
-)
-
-# ---------- Setup ----------
-$stamp   = Get-Date -Format "yyyyMMdd_HHmmss"
-$null    = New-Item -ItemType Directory -Path $OutputFolder -Force
-$logPath = Join-Path $OutputFolder "TagVerification_$stamp.log"
-$fullCsv = Join-Path $OutputFolder "TagVerification_${stamp}_Full.csv"
-$misCsv  = Join-Path $OutputFolder "TagVerification_${stamp}_Mismatches.csv"
-
 function Write-Log {
     param([string]$Message, [string]$Color = "")
     $line = "[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $Message
     if ($Color) { Write-Host $line -ForegroundColor $Color } else { Write-Host $line }
-    Add-Content -Path $logPath -Value $line
 }
-
 function Write-Plain {
-    # Summary lines: printed and logged without timestamps
     param([string]$Message = "", [string]$Color = "")
     if ($Color) { Write-Host $Message -ForegroundColor $Color } else { Write-Host $Message }
-    Add-Content -Path $logPath -Value $Message
 }
 
-# ---------- Pre-flight checks ----------
-if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-    throw "ImportExcel module not found. Run: Install-Module ImportExcel -Scope CurrentUser"
+# ---------- Pre-flight ----------
+if ($PSVersionTable.PSEdition -eq "Core") {
+    throw "This script needs Windows PowerShell 5.1 (not PowerShell 7) to talk to the open Excel window."
 }
 if (-not (Get-Module -ListAvailable -Name Az.Resources)) {
     throw "Az.Resources module not found. Run: Install-Module Az.Accounts, Az.Resources -Scope CurrentUser"
 }
-Import-Module ImportExcel
+if (-not (Get-AzContext)) { throw "Not signed in to Azure. Run Connect-AzAccount first." }
 
-if (-not (Test-Path $ExcelPath)) { throw "Excel file not found: $ExcelPath" }
+# ---------- Read the OPEN workbook (read-only) ----------
+$excel = $null
+try { $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application") }
+catch { throw "Excel is not running (or runs at a different privilege level). Open $WorkbookName.xlsx in Excel and retry." }
 
-if (-not (Get-AzContext)) {
-    throw "Not signed in to Azure. Run Connect-AzAccount first."
+$wb = $null
+foreach ($w in $excel.Workbooks) {
+    if ($w.Name -like "$WorkbookName*") { $wb = $w; break }
+}
+if (-not $wb) {
+    $open = @(foreach ($w in $excel.Workbooks) { $w.Name }) -join ", "
+    throw "Workbook '$WorkbookName' is not open in Excel. Open workbooks: $open"
 }
 
-Write-Log "Starting tag verification"
-Write-Log "Excel file : $((Resolve-Path $ExcelPath).Path)"
-Write-Log "Azure acct : $((Get-AzContext).Account.Id)"
-
-# ---------- Read workbook ----------
 try {
-    $rows = @(Import-Excel -Path $ExcelPath -WorksheetName $SheetName)
+    $ws   = $wb.Worksheets.Item($SheetName)
+    $data = $ws.UsedRange.Value2          # one-shot read into a 2D array; changes nothing
 }
 catch {
-    throw "Could not read '$ExcelPath' (is it open in Excel?). $($_.Exception.Message)"
+    throw "Could not read sheet '$SheetName'. Make sure no cell is being edited in Excel. $($_.Exception.Message)"
 }
-if ($rows.Count -eq 0) { throw "No data rows found on sheet '$SheetName'." }
+finally {
+    if ($ws) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ws) }
+}
 
-$headers = $rows[0].PSObject.Properties.Name
-foreach ($h in @("SubscriptionName", "SubscriptionId") + ($TagsToCheck | ForEach-Object { $_.Column })) {
-    if ($h -notin $headers) {
-        throw "Column '$h' not found in sheet. Headers found: $($headers -join ', ')"
+if ($data -isnot [object[,]]) { throw "Sheet '$SheetName' does not contain a data table." }
+
+function ConvertTo-CellString($v) {
+    if ($null -eq $v) { return "" }
+    if ($v -is [double]) { return $v.ToString("0.##########", [Globalization.CultureInfo]::InvariantCulture) }
+    return [string]$v
+}
+
+# Locate columns by header name in row 1
+$rowCount = $data.GetLength(0)
+$colCount = $data.GetLength(1)
+$col = @{}
+for ($c = 1; $c -le $colCount; $c++) {
+    $h = (ConvertTo-CellString $data[1, $c]).Trim()
+    if ($h) { $col[$h] = $c }
+}
+foreach ($h in "SubscriptionName", "SubscriptionId", "BA ID", "EIM") {
+    if (-not $col.ContainsKey($h)) {
+        throw "Header '$h' not found in row 1. Headers found: $($col.Keys -join ', ')"
     }
 }
 
-# Drop empty rows, warn on duplicate subscription IDs
-$rows = @($rows | Where-Object { "$($_.SubscriptionId)".Trim() })
-$dupes = $rows | Group-Object { "$($_.SubscriptionId)".Trim().ToLower() } | Where-Object Count -gt 1
-foreach ($d in $dupes) { Write-Log "WARNING: duplicate SubscriptionId in sheet: $($d.Name) ($($d.Count) rows)" "Yellow" }
+$rows = for ($r = 2; $r -le $rowCount; $r++) {
+    $id = (ConvertTo-CellString $data[$r, $col["SubscriptionId"]]).Trim()
+    if (-not $id) { continue }
+    [pscustomobject]@{
+        Row              = $r
+        SubscriptionName = (ConvertTo-CellString $data[$r, $col["SubscriptionName"]]).Trim()
+        SubscriptionId   = $id
+        BAID             = ConvertTo-CellString $data[$r, $col["BA ID"]]
+        EIM              = ConvertTo-CellString $data[$r, $col["EIM"]]
+    }
+}
+$rows = @($rows)
 
+Write-Log "Starting tag verification (read-only, no files written)"
+Write-Log "Workbook   : $($wb.Name)  |  Sheet: $SheetName"
+Write-Log "Azure acct : $((Get-AzContext).Account.Id)"
 Write-Log "Subscriptions to check: $($rows.Count)"
+
+$dupes = $rows | Group-Object { $_.SubscriptionId.ToLower() } | Where-Object Count -gt 1
+foreach ($d in $dupes) { Write-Log "WARNING: duplicate SubscriptionId in sheet: $($d.Name) ($($d.Count) rows)" "Yellow" }
 
 # ---------- Helpers ----------
 function Get-SubscriptionTags {
@@ -110,7 +126,6 @@ function Get-SubscriptionTags {
         }
         catch {
             $msg = $_.Exception.Message
-            # Don't retry on auth/permission/not-found errors
             if ($msg -match "AuthorizationFailed|SubscriptionNotFound|InvalidAuthenticationToken|not found|Forbidden|does not have authorization") { throw }
             if ($attempt -eq $MaxRetries) { throw }
             Start-Sleep -Seconds (2 * $attempt)
@@ -119,7 +134,6 @@ function Get-SubscriptionTags {
 }
 
 function Get-TagValue {
-    # Azure tag NAMES are case-insensitive, so look the key up case-insensitively
     param($Tags, [string]$Name)
     if (-not $Tags) { return @{ Exists = $false; Value = $null } }
     foreach ($k in $Tags.Keys) {
@@ -130,9 +144,8 @@ function Get-TagValue {
 
 function Compare-TagValue {
     param([string]$Excel, [bool]$AzureExists, [string]$Azure)
-
     if (-not $AzureExists) {
-        if ([string]::IsNullOrEmpty($Excel)) { return "MATCH" }       # both empty
+        if ([string]::IsNullOrEmpty($Excel)) { return "MATCH" }
         return "TAG_MISSING_IN_AZURE"
     }
     if ($Excel -ceq $Azure) { return "MATCH" }
@@ -142,148 +155,110 @@ function Compare-TagValue {
     return "VALUE_MISMATCH"
 }
 
+$TagsToCheck = @(
+    @{ Tag = "BA ID"; Prop = "BAID" },
+    @{ Tag = "EIM";   Prop = "EIM"  }
+)
+
 # ---------- Main loop ----------
 $results = New-Object System.Collections.Generic.List[object]
 $i = 0
 
 foreach ($row in $rows) {
     $i++
-    $subId   = "$($row.SubscriptionId)".Trim()
-    $subName = "$($row.SubscriptionName)".Trim()
+    Write-Progress -Activity "Verifying subscription tags" -Status "$i of $($rows.Count): $($row.SubscriptionName)" -PercentComplete (($i / $rows.Count) * 100)
 
-    Write-Progress -Activity "Verifying subscription tags" -Status "$i of $($rows.Count): $subName" -PercentComplete (($i / $rows.Count) * 100)
-
-    $row_result = [ordered]@{
-        SubscriptionName = $subName
-        SubscriptionId   = $subId
-    }
     $issues = @()
     $fetchError = $null
     $tags = $null
 
-    try { $tags = Get-SubscriptionTags -SubId $subId }
+    try { $tags = Get-SubscriptionTags -SubId $row.SubscriptionId }
     catch { $fetchError = ($_.Exception.Message -split "`n")[0].Trim() }
 
-    foreach ($t in $TagsToCheck) {
-        $excelVal = "$($row.($t.Column))"
-        $prefix   = ($t.Tag -replace '\s', '')   # "BAID", "EIM"
-
-        if ($fetchError) {
-            $row_result["Excel_$prefix"]  = $excelVal
-            $row_result["Azure_$prefix"]  = "<unavailable>"
-            $row_result["Result_$prefix"] = "ERROR"
-            continue
-        }
-
-        $az     = Get-TagValue -Tags $tags -Name $t.Tag
-        $status = Compare-TagValue -Excel $excelVal -AzureExists $az.Exists -Azure $az.Value
-
-        $row_result["Excel_$prefix"]  = $excelVal
-        $row_result["Azure_$prefix"]  = if ($az.Exists) { $az.Value } else { "<tag not set>" }
-        $row_result["Result_$prefix"] = $status
-
-        if ($status -ne "MATCH") {
-            $issues += [pscustomobject]@{
-                Tag        = $t.Tag
-                Issue      = $status
-                ExcelValue = $excelVal
-                AzureValue = if ($az.Exists) { $az.Value } else { "<tag not set>" }
+    if (-not $fetchError) {
+        foreach ($t in $TagsToCheck) {
+            $excelVal = $row.($t.Prop)
+            $az       = Get-TagValue -Tags $tags -Name $t.Tag
+            $status   = Compare-TagValue -Excel $excelVal -AzureExists $az.Exists -Azure $az.Value
+            if ($status -ne "MATCH") {
+                $issues += [pscustomobject]@{
+                    Tag        = $t.Tag
+                    Issue      = $status
+                    ExcelValue = $excelVal
+                    AzureValue = if ($az.Exists) { $az.Value } else { "<tag not set>" }
+                }
             }
         }
     }
 
-    $row_result["OverallStatus"] = if ($fetchError) { "ERROR" } elseif ($issues.Count -eq 0) { "MATCH" } else { "MISMATCH" }
-    $row_result["Details"]       = if ($fetchError) { $fetchError }
-                                   else { ($issues | ForEach-Object { "$($_.Tag): $($_.Issue)" }) -join "; " }
+    $overall = if ($fetchError) { "ERROR" } elseif ($issues.Count -eq 0) { "MATCH" } else { "MISMATCH" }
+    $details = if ($fetchError) { $fetchError } else { ($issues | ForEach-Object { "$($_.Tag): $($_.Issue)" }) -join "; " }
 
-    $obj = [pscustomobject]$row_result
-    $obj | Add-Member -NotePropertyName "_Issues" -NotePropertyValue $issues
-    $results.Add($obj)
+    $results.Add([pscustomobject]@{
+        Row = $row.Row; SubscriptionName = $row.SubscriptionName; SubscriptionId = $row.SubscriptionId
+        Status = $overall; Details = $details; Issues = $issues
+    })
 
-    if ($obj.OverallStatus -eq "MATCH") { Write-Log "OK        $subName ($subId)" }
-    elseif ($obj.OverallStatus -eq "ERROR") { Write-Log "ERROR     $subName ($subId) - $fetchError" "Red" }
-    else { Write-Log "MISMATCH  $subName ($subId) - $($obj.Details)" "Yellow" }
+    switch ($overall) {
+        "MATCH"    { Write-Log "OK        $($row.SubscriptionName) ($($row.SubscriptionId))" }
+        "ERROR"    { Write-Log "ERROR     $($row.SubscriptionName) ($($row.SubscriptionId)) - $fetchError" "Red" }
+        "MISMATCH" { Write-Log "MISMATCH  $($row.SubscriptionName) ($($row.SubscriptionId)) - $details" "Yellow" }
+    }
 }
 Write-Progress -Activity "Verifying subscription tags" -Completed
 
-# ---------- Export CSVs ----------
-$exportCols = $results | Select-Object * -ExcludeProperty _Issues
-$exportCols | Export-Csv -Path $fullCsv -NoTypeInformation
-$problems = @($results | Where-Object OverallStatus -ne "MATCH")
-if ($problems.Count -gt 0) {
-    $problems | Select-Object * -ExcludeProperty _Issues | Export-Csv -Path $misCsv -NoTypeInformation
-}
-
 # ---------- Final summary (all together) ----------
 $total    = $results.Count
-$matched  = @($results | Where-Object OverallStatus -eq "MATCH").Count
-$mismatch = @($results | Where-Object OverallStatus -eq "MISMATCH").Count
-$errored  = @($results | Where-Object OverallStatus -eq "ERROR").Count
+$matched  = @($results | Where-Object Status -eq "MATCH").Count
+$mismatch = @($results | Where-Object Status -eq "MISMATCH")
+$errored  = @($results | Where-Object Status -eq "ERROR")
 $pct      = if ($total) { [math]::Round(($matched / $total) * 100, 2) } else { 0 }
 
 Write-Plain ""
 Write-Plain ("=" * 78)
-Write-Plain "  TAG VERIFICATION SUMMARY   (tags checked: BA ID, EIM)"
+Write-Plain "  TAG VERIFICATION SUMMARY   (tags checked: BA ID = col C, EIM = col D)"
 Write-Plain ("=" * 78)
 Write-Plain "  Run time              : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 Write-Plain "  Subscriptions checked : $total"
-Write-Plain "  Matched               : $matched"   "Green"
-Write-Plain "  Mismatched            : $mismatch"  $(if ($mismatch) { "Yellow" } else { "Green" })
-Write-Plain "  Errors (not verified) : $errored"   $(if ($errored)  { "Red" }    else { "Green" })
+Write-Plain "  Matched               : $matched" "Green"
+Write-Plain "  Mismatched            : $($mismatch.Count)" $(if ($mismatch.Count) { "Yellow" } else { "Green" })
+Write-Plain "  Errors (not verified) : $($errored.Count)"  $(if ($errored.Count)  { "Red" }    else { "Green" })
 Write-Plain "  Match rate            : $pct%"
 Write-Plain ("-" * 78)
 
 if ($matched -eq $total -and $total -gt 0) {
-    Write-Plain "  RESULT: 100% MATCH - every BA ID and EIM value in the sheet equals Azure." "Green"
+    Write-Plain "  RESULT: 100% MATCH - every BA ID and EIM value in the sheet equals the live Azure tag." "Green"
 }
 else {
-    Write-Plain "  RESULT: NOT A 100% MATCH - $($problems.Count) subscription(s) need attention." "Red"
+    Write-Plain "  RESULT: NOT A 100% MATCH - $($mismatch.Count + $errored.Count) subscription(s) need attention." "Red"
 
-    # Breakdown by issue type
-    $allIssues = $results | ForEach-Object {
-        $r = $_
-        foreach ($iss in $r._Issues) {
-            [pscustomobject]@{ Sub = $r.SubscriptionName; Id = $r.SubscriptionId; Tag = $iss.Tag; Issue = $iss.Issue; Excel = $iss.ExcelValue; Azure = $iss.AzureValue }
-        }
-    }
-    if ($allIssues) {
+    if ($mismatch.Count -gt 0) {
         Write-Plain ""
         Write-Plain "  Issue breakdown:"
-        $allIssues | Group-Object Tag, Issue | Sort-Object Name | ForEach-Object {
-            Write-Plain ("    {0,-40} {1}" -f $_.Name, $_.Count)
-        }
-    }
+        $mismatch | ForEach-Object { $_.Issues } | Group-Object Tag, Issue | Sort-Object Name |
+            ForEach-Object { Write-Plain ("    {0,-40} {1}" -f $_.Name, $_.Count) }
 
-    # Mismatched subscriptions
-    $mis = @($results | Where-Object OverallStatus -eq "MISMATCH")
-    if ($mis.Count -gt 0) {
         Write-Plain ""
-        Write-Plain "  MISMATCHED SUBSCRIPTIONS ($($mis.Count)):" "Yellow"
-        foreach ($m in $mis) {
+        Write-Plain "  MISMATCHED SUBSCRIPTIONS ($($mismatch.Count)):" "Yellow"
+        foreach ($m in $mismatch) {
             Write-Plain ""
-            Write-Plain "  * $($m.SubscriptionName)"
+            Write-Plain "  * $($m.SubscriptionName)   (Excel row $($m.Row))"
             Write-Plain "    ID: $($m.SubscriptionId)"
-            foreach ($iss in $m._Issues) {
+            foreach ($iss in $m.Issues) {
                 Write-Plain ("    - {0,-6} {1,-22} Excel='{2}'  Azure='{3}'" -f $iss.Tag, $iss.Issue, $iss.ExcelValue, $iss.AzureValue)
             }
         }
     }
 
-    # Subscriptions that could not be verified
-    $err = @($results | Where-Object OverallStatus -eq "ERROR")
-    if ($err.Count -gt 0) {
+    if ($errored.Count -gt 0) {
         Write-Plain ""
-        Write-Plain "  COULD NOT BE VERIFIED ($($err.Count)) - check access / tenant / sign-in:" "Red"
-        foreach ($e in $err) {
-            Write-Plain "  * $($e.SubscriptionName)  [$($e.SubscriptionId)]"
+        Write-Plain "  COULD NOT BE VERIFIED ($($errored.Count)) - check access / tenant / sign-in:" "Red"
+        foreach ($e in $errored) {
+            Write-Plain "  * $($e.SubscriptionName)   (Excel row $($e.Row))  [$($e.SubscriptionId)]"
             Write-Plain "    $($e.Details)"
         }
     }
 }
-
-Write-Plain ""
-Write-Plain ("-" * 78)
-Write-Plain "  Full results : $fullCsv"
-if ($problems.Count -gt 0) { Write-Plain "  Mismatches   : $misCsv" }
-Write-Plain "  Log file     : $logPath"
+Write-Plain ("=" * 78)
+Write-Plain "  No files were created or modified. Excel workbook left untouched."
 Write-Plain ("=" * 78)
