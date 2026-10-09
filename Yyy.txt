@@ -1,44 +1,56 @@
 <#
 .SYNOPSIS
-  Checks that the BA ID + EIM pairs in your subscription-tags workbook
-  (Stage1Analysis-TagsMapping.xlsx: column C = BA ID, column D = EIM)
-  match the official mapping in the CMDB workbook
-  (column A "Number" = BA ID, column F "EIM Application Instance ID" = EIM).
+  Builds a NEW Excel report of subscription tags.
 
-  A subscription is a MATCH when its exact (BA ID, EIM) pair exists as a row
-  in the CMDB file.
+  INPUT : an Excel file with subscription name (column A) and/or subscription ID (column B).
+  OUTPUT: a new .xlsx with columns
+            SubscriptionName | SubscriptionId | BA ID | EIM | EHC ID
+          (the last three are the live Azure subscription tags).
 
-  READ-ONLY and FILE-FREE:
-    - Both workbooks are opened READ-ONLY through Excel (nothing saved or edited).
-    - It does NOT connect to Azure at all.
-    - Writes NOTHING to disk. All logs and the final summary print on screen.
+  Logging: everything prints on screen (no log file). At the end you get ONE summary
+  that lists every subscription missing any of the three tags, plus any subscription
+  that could not be read.
+
+.READ-ONLY GUARANTEE
+  - Azure   : only reads (Get-AzSubscription, Get-AzTag). Nothing in Azure is changed.
+  - Input   : the input workbook is only read, never saved or edited.
+  - The ONLY file written is the new report .xlsx (never overwrites an existing file).
+
+.PREREQUISITES
+  - Microsoft Excel installed (used to read the input and write the report; no extra modules).
+  - Install-Module Az.Accounts, Az.Resources -Scope CurrentUser
+  - Connect-AzAccount
 
 .USAGE
-  1. Set the two paths in the param block below (or pass them as parameters).
-  2. Run the script (F5, or  .\Verify-BAID-EIM-Mapping.ps1 ).
-  Each workbook may be open or closed in Excel; both work.
+  1. Set $InputExcelPath below (or pass -InputExcelPath).
+  2. Run the script. The report is saved next to the input file unless you set -OutputPath.
+
+  Name only / ID only rows are fine: a missing ID is looked up from the name,
+  and a missing name is filled in from the ID.
+
+  If your input sheet has an active filter (e.g. "251 of 254 records found"), hidden rows are
+  INCLUDED by default. Add -VisibleRowsOnly to process only the rows you can see.
 #>
 
 [CmdletBinding()]
 param(
-    # >>> SET YOUR TWO FILE PATHS HERE <<<
-    [string]$TagsExcelPath = "C:\Path\To\Stage1Analysis-TagsMapping.xlsx",
-    [string]$CmdbExcelPath = "C:\Path\To\cmdb_ci_business_app.xlsx",
+    # >>> SET YOUR INPUT FILE PATH HERE <<<
+    [string]$InputExcelPath = "C:\Path\To\Your-Subscriptions-List.xlsx",
+    [string]$SheetName      = "Sheet1",
+    [string]$NameHeader     = "SubscriptionName",
+    [string]$IdHeader       = "SubscriptionId",
 
-    # Sheet names
-    [string]$TagsSheetName = "Sheet1",
-    [string]$CmdbSheetName = "cmdb_ci_business_app",
+    # Leave blank to save next to the input file as SubscriptionTagsReport_<timestamp>.xlsx
+    [string]$OutputPath     = "",
 
-    # Header names (row 1)
-    [string]$TagsNameHeader = "SubscriptionName",
-    [string]$TagsIdHeader   = "SubscriptionId",
-    [string]$TagsBAHeader   = "BA ID",
-    [string]$TagsEimHeader  = "EIM",
-    [string]$CmdbBAHeader   = "Number",
-    [string]$CmdbEimHeader  = "EIM Application Instance ID"
+    [switch]$VisibleRowsOnly,
+    [int]$MaxRetries        = 3
 )
 
 $ErrorActionPreference = "Stop"
+
+# Tags to collect (this order = column order in the report)
+$TagNames = @("BA ID", "EIM", "EHC ID")
 
 function Write-Log {
     param([string]$Message, [string]$Color = "")
@@ -50,249 +62,349 @@ function Write-Plain {
     if ($Color) { Write-Host $Message -ForegroundColor $Color } else { Write-Host $Message }
 }
 
-# ---------- Excel helpers (read-only) ----------
-function Get-SheetData {
-    param([string]$Path, [string]$Sheet)
-
-    if (-not (Test-Path -LiteralPath $Path)) { throw "File not found: $Path  (set the correct path at the top of the script)" }
-    $full = (Resolve-Path -LiteralPath $Path).Path
-
-    $excel = $null; $wb = $null; $ws = $null; $own = $false; $running = $null
-
-    # If the file is already open in a running Excel, read it from there
-    try { $running = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application") } catch { $running = $null }
-    if ($running) {
-        foreach ($w in $running.Workbooks) {
-            if ($w.FullName -ieq $full) { $wb = $w; $excel = $running; break }
-        }
-    }
-
-    try {
-        if (-not $wb) {
-            # Otherwise open READ-ONLY in a separate, hidden Excel instance
-            $excel = New-Object -ComObject Excel.Application
-            $excel.Visible = $false
-            $excel.DisplayAlerts = $false
-            $own = $true
-            $wb = $excel.Workbooks.Open($full, 0, $true)     # UpdateLinks=0, ReadOnly=true
-        }
-        $ws   = $wb.Worksheets.Item($Sheet)
-        $data = $ws.UsedRange.Value2
-    }
-    catch {
-        throw "Could not read sheet '$Sheet' from '$full'. If the file is open, make sure no cell is in edit mode. $($_.Exception.Message)"
-    }
-    finally {
-        if ($ws) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ws) }
-        if ($own) {
-            if ($wb)    { try { $wb.Close($false) } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wb) }
-            if ($excel) { try { $excel.Quit() } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
-        }
-    }
-
-    if ($data -isnot [object[,]]) { return $null }     # empty sheet
-    return ,$data
+# ---------- Pre-flight ----------
+if (-not (Get-Module -ListAvailable -Name Az.Resources)) {
+    throw "Az.Resources module not found. Run: Install-Module Az.Accounts, Az.Resources -Scope CurrentUser"
 }
+if (-not (Get-AzContext)) { throw "Not signed in to Azure. Run Connect-AzAccount first." }
+if (-not (Test-Path -LiteralPath $InputExcelPath)) {
+    throw "Input file not found: $InputExcelPath  (set the correct path at the top of the script)"
+}
+$fullInput = (Resolve-Path -LiteralPath $InputExcelPath).Path
 
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+if (-not $OutputPath) {
+    $OutputPath = Join-Path (Split-Path -Parent $fullInput) "SubscriptionTagsReport_$stamp.xlsx"
+}
+if ([IO.Path]::GetExtension($OutputPath).ToLower() -ne ".xlsx") { throw "-OutputPath must end with .xlsx" }
+$outDir = Split-Path -Parent $OutputPath
+if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { throw "Output folder does not exist: $outDir" }
+if (Test-Path -LiteralPath $OutputPath) { throw "Output file already exists (not overwriting): $OutputPath" }
+
+# ---------- Excel helpers ----------
 function ConvertTo-CellString($v) {
     if ($null -eq $v) { return "" }
     if ($v -is [double]) { return $v.ToString("0.##########", [Globalization.CultureInfo]::InvariantCulture) }
     return [string]$v
 }
 
-function Get-HeaderMap {
-    param($Data, [string]$Label, [string[]]$Required)
-    $map = @{}
-    for ($c = 1; $c -le $Data.GetLength(1); $c++) {
-        $h = (ConvertTo-CellString $Data[1, $c]).Trim()
-        if ($h -and -not $map.ContainsKey($h)) { $map[$h] = $c }
-    }
-    foreach ($h in $Required) {
-        if (-not $map.ContainsKey($h)) {
-            throw "[$Label] Header '$h' not found in row 1. Headers found: $($map.Keys -join ', ')"
+function Read-InputSheet {
+    # Reads the sheet read-only. Returns the cell values and which data rows are hidden by a filter.
+    param([string]$FullPath, [string]$Sheet)
+
+    $excel = $null; $wb = $null; $ws = $null; $ur = $null
+    $own = $false; $running = $null; $data = $null; $hidden = @{}
+
+    try { $running = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application") } catch { $running = $null }
+    if ($running) {
+        foreach ($w in $running.Workbooks) {
+            if ($w.FullName -ieq $FullPath) { $wb = $w; $excel = $running; break }
         }
     }
-    return $map
+
+    try {
+        if (-not $wb) {
+            $excel = New-Object -ComObject Excel.Application
+            $excel.Visible = $false
+            $excel.DisplayAlerts = $false
+            $own = $true
+            $wb = $excel.Workbooks.Open($FullPath, 0, $true)      # UpdateLinks=0, ReadOnly=true
+        }
+        $ws = if ($Sheet) { $wb.Worksheets.Item($Sheet) } else { $wb.Worksheets.Item(1) }
+        $ur = $ws.UsedRange
+        $data = $ur.Value2
+        $firstRow = [int]$ur.Row
+        if ($data -is [object[,]]) {
+            $n = $data.GetLength(0)
+            for ($k = 2; $k -le $n; $k++) {
+                if ([bool]$ws.Rows.Item($firstRow + $k - 1).Hidden) { $hidden[$k] = $true }
+            }
+        }
+    }
+    catch {
+        throw "Could not read sheet '$Sheet' from '$FullPath'. If the file is open, make sure no cell is in edit mode. $($_.Exception.Message)"
+    }
+    finally {
+        if ($ur) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ur) }
+        if ($ws) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ws) }
+        if ($own) {
+            if ($wb)    { try { $wb.Close($false) } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wb) }
+            if ($excel) { try { $excel.Quit() } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
+        }
+    }
+    return @{ Data = $data; Hidden = $hidden }
 }
 
-function Format-Short {
-    param($Items, [int]$Max = 5)
-    $arr = @($Items | Sort-Object)
-    if ($arr.Count -eq 0) { return "none" }
-    if ($arr.Count -le $Max) { return ($arr -join ", ") }
-    return (($arr[0..($Max - 1)] -join ", ") + " (+$($arr.Count - $Max) more)")
+# ---------- Read the input list ----------
+Write-Log "Starting subscription tag report (Azure access is read-only)"
+Write-Log "Reading input list: $fullInput"
+$in   = Read-InputSheet -FullPath $fullInput -Sheet $SheetName
+$data = $in.Data
+if ($data -isnot [object[,]]) { throw "The input sheet is empty." }
+
+$col = @{}
+for ($c = 1; $c -le $data.GetLength(1); $c++) {
+    $h = (ConvertTo-CellString $data[1, $c]).Trim()
+    if ($h -and -not $col.ContainsKey($h)) { $col[$h] = $c }
+}
+foreach ($h in @($NameHeader, $IdHeader)) {
+    if (-not $col.ContainsKey($h)) { throw "Header '$h' not found in row 1. Headers found: $($col.Keys -join ', ')" }
 }
 
-# ---------- Load CMDB mapping ----------
-Write-Log "Starting BA ID / EIM mapping verification (read-only, no files written, no Azure access)"
-Write-Log "Reading CMDB mapping: $CmdbExcelPath"
-$cm     = Get-SheetData -Path $CmdbExcelPath -Sheet $CmdbSheetName
-$cmCols = $null
-if ($cm) { $cmCols = Get-HeaderMap -Data $cm -Label "CMDB" -Required @($CmdbBAHeader, $CmdbEimHeader) }
+$inputRows   = New-Object System.Collections.Generic.List[object]
+$hiddenCount = 0
+$skippedHidden = 0
+for ($r = 2; $r -le $data.GetLength(0); $r++) {
+    $n  = (ConvertTo-CellString $data[$r, $col[$NameHeader]]).Trim()
+    $id = (ConvertTo-CellString $data[$r, $col[$IdHeader]]).Trim()
+    if (-not $n -and -not $id) { continue }
+    $isHidden = $in.Hidden.ContainsKey($r)
+    if ($isHidden) { $hiddenCount++ }
+    if ($isHidden -and $VisibleRowsOnly) { $skippedHidden++; continue }
+    $inputRows.Add([pscustomobject]@{ Row = $r; Name = $n; Id = $id })
+}
+if ($inputRows.Count -eq 0) { throw "No subscription rows found in the input sheet." }
 
-$exactPairs = New-Object 'System.Collections.Generic.HashSet[string]'
-$normPairs  = New-Object 'System.Collections.Generic.HashSet[string]'
-$baToEims   = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.HashSet[string]]'
-$eimToBas   = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.HashSet[string]]'
+Write-Log "Input rows to process: $($inputRows.Count)"
+if ($hiddenCount -gt 0) {
+    if ($VisibleRowsOnly) { Write-Log "NOTE: $hiddenCount row(s) are hidden by a filter and were SKIPPED (-VisibleRowsOnly)." "Yellow" }
+    else { Write-Log "NOTE: $hiddenCount row(s) are hidden by a filter and are INCLUDED. Use -VisibleRowsOnly to skip them." "Yellow" }
+}
 
-$cmRows = 0
-$cmLast = if ($cm) { $cm.GetLength(0) } else { 0 }
-for ($r = 2; $r -le $cmLast; $r++) {
-    $ba  = ConvertTo-CellString $cm[$r, $cmCols[$CmdbBAHeader]]
-    $eim = ConvertTo-CellString $cm[$r, $cmCols[$CmdbEimHeader]]
-    if (-not $ba.Trim()) { continue }
-    $cmRows++
+$dupes = $inputRows | Where-Object { $_.Id } | Group-Object { $_.Id.ToLower() } | Where-Object Count -gt 1
+foreach ($d in $dupes) { Write-Log "WARNING: duplicate subscription ID in input: $($d.Name) ($($d.Count) rows)" "Yellow" }
 
-    [void]$exactPairs.Add("$ba|$eim")
-    $nb = $ba.Trim().ToLowerInvariant()
-    $ne = $eim.Trim().ToLowerInvariant()
-    [void]$normPairs.Add("$nb|$ne")
+# ---------- Azure subscription lookup (read-only) ----------
+$subById = @{}; $subByName = @{}
+try {
+    foreach ($s in @(Get-AzSubscription -ErrorAction Stop)) {
+        $subById[$s.Id.ToLower()] = $s
+        $k = $s.Name.ToLower()
+        if (-not $subByName.ContainsKey($k)) { $subByName[$k] = New-Object System.Collections.Generic.List[object] }
+        $subByName[$k].Add($s)
+    }
+    Write-Log "Accessible subscriptions found in Azure: $($subById.Count)"
+}
+catch {
+    Write-Log "WARNING: could not list subscriptions ($(($_.Exception.Message -split "`n")[0])). Rows with only a name cannot be resolved." "Yellow"
+}
 
-    if (-not $baToEims.ContainsKey($nb)) { $baToEims[$nb] = New-Object 'System.Collections.Generic.HashSet[string]' }
-    if ($ne) {
-        [void]$baToEims[$nb].Add($ne)
-        if (-not $eimToBas.ContainsKey($ne)) { $eimToBas[$ne] = New-Object 'System.Collections.Generic.HashSet[string]' }
-        [void]$eimToBas[$ne].Add($ba.Trim())
+# ---------- Helpers ----------
+function Get-SubscriptionTags {
+    param([string]$SubId)
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            $t = Get-AzTag -ResourceId "/subscriptions/$SubId" -ErrorAction Stop
+            return $t.Properties.TagsProperty
+        }
+        catch {
+            $msg = $_.Exception.Message
+            if ($msg -match "AuthorizationFailed|SubscriptionNotFound|InvalidAuthenticationToken|not found|Forbidden|does not have authorization") { throw }
+            if ($attempt -eq $MaxRetries) { throw }
+            Start-Sleep -Seconds (2 * $attempt)
+        }
     }
 }
-$multiEim = @($baToEims.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 }).Count
-Write-Log "CMDB rows loaded: $cmRows  |  distinct BA IDs: $($baToEims.Count)  |  BA IDs with more than one EIM: $multiEim"
-if ($cmRows -eq 0) {
-    Write-Log "WARNING: the CMDB sheet has NO mapping rows. Every subscription will be reported as NO_MAPPING_IN_CMDB." "Yellow"
-}
 
-# ---------- Load subscription-tags workbook ----------
-Write-Log "Reading subscription tags workbook: $TagsExcelPath"
-$tg     = Get-SheetData -Path $TagsExcelPath -Sheet $TagsSheetName
-if (-not $tg) { throw "The subscription tags sheet '$TagsSheetName' is empty." }
-$tgCols = Get-HeaderMap -Data $tg -Label "TAGS" -Required @($TagsNameHeader, $TagsIdHeader, $TagsBAHeader, $TagsEimHeader)
-
-$rows = for ($r = 2; $r -le $tg.GetLength(0); $r++) {
-    $name = (ConvertTo-CellString $tg[$r, $tgCols[$TagsNameHeader]]).Trim()
-    $id   = (ConvertTo-CellString $tg[$r, $tgCols[$TagsIdHeader]]).Trim()
-    if (-not $name -and -not $id) { continue }
-    [pscustomobject]@{
-        Row = $r; SubscriptionName = $name; SubscriptionId = $id
-        BA  = ConvertTo-CellString $tg[$r, $tgCols[$TagsBAHeader]]
-        EIM = ConvertTo-CellString $tg[$r, $tgCols[$TagsEimHeader]]
+function Get-TagValue {
+    # Azure tag NAMES are case-insensitive
+    param($Tags, [string]$Name)
+    if (-not $Tags) { return @{ Exists = $false; Value = "" } }
+    foreach ($k in $Tags.Keys) {
+        if ($k -ieq $Name) { return @{ Exists = $true; Value = "$($Tags[$k])" } }
     }
+    return @{ Exists = $false; Value = "" }
 }
-$rows = @($rows)
-Write-Log "Subscriptions to check: $($rows.Count)"
 
 # ---------- Main loop ----------
 $results = New-Object System.Collections.Generic.List[object]
 $i = 0
 
-foreach ($row in $rows) {
+foreach ($row in $inputRows) {
     $i++
-    Write-Progress -Activity "Checking BA ID / EIM against CMDB" -Status "$i of $($rows.Count): $($row.SubscriptionName)" -PercentComplete (($i / $rows.Count) * 100)
+    $name = $row.Name; $id = $row.Id; $err = $null
 
-    $ba = $row.BA; $eim = $row.EIM
-    $nb = $ba.Trim().ToLowerInvariant()
-    $ne = $eim.Trim().ToLowerInvariant()
+    Write-Progress -Activity "Reading subscription tags" -Status "$i of $($inputRows.Count): $name $id" -PercentComplete (($i / $inputRows.Count) * 100)
 
-    if ($exactPairs.Contains("$ba|$eim")) {
-        $status = "MATCH"; $detail = ""
-    }
-    elseif ($normPairs.Contains("$nb|$ne")) {
-        $status = "FORMAT_DIFFERENCE"
-        $detail = "Pair matches CMDB except for extra spaces or letter case."
-    }
-    elseif ($nb -eq "" -or $nb -eq "nf") {
-        if ($ne -and $eimToBas.ContainsKey($ne)) {
-            $status = "BA_ID_NF_OR_BLANK"
-            $detail = "No BA ID in sheet. In CMDB, EIM $eim belongs to BA ID(s): $(Format-Short $eimToBas[$ne])"
-        }
-        else {
-            $status = "NO_MAPPING_IN_CMDB"
-            $detail = "No BA ID in sheet, and EIM '$eim' is not found anywhere in the CMDB."
-        }
-    }
-    elseif (-not $baToEims.ContainsKey($nb)) {
-        if ($ne -and $eimToBas.ContainsKey($ne)) {
-            $status = "BA_ID_NOT_IN_CMDB"
-            $detail = "BA ID not in CMDB. In CMDB, EIM $eim belongs to BA ID(s): $(Format-Short $eimToBas[$ne])"
-        }
-        else {
-            $status = "NO_MAPPING_IN_CMDB"
-            $detail = "Neither BA ID '$ba' nor EIM '$eim' exists anywhere in the CMDB."
-        }
-    }
-    elseif ($baToEims[$nb].Count -eq 0) {
-        $status = "BA_ID_IN_CMDB_WITHOUT_EIM"
-        $detail = "BA ID $ba exists in CMDB but has no EIM filled in."
-        if ($ne -and $eimToBas.ContainsKey($ne)) { $detail += "  |  EIM $eim is mapped in CMDB to BA ID(s): $(Format-Short $eimToBas[$ne])" }
-    }
-    elseif ($ne -eq "") {
-        $status = "EIM_BLANK_IN_SHEET"
-        $detail = "EIM is blank. CMDB EIM(s) for $ba : $(Format-Short $baToEims[$nb])"
+    # Resolve ID from name / name from ID
+    if (-not $id) {
+        $m = $subByName[$name.ToLower()]
+        if (-not $m)               { $err = "Subscription name not found in accessible subscriptions (cannot resolve ID)." }
+        elseif ($m.Count -gt 1)    { $err = "Subscription name matches $($m.Count) subscriptions; add the subscription ID to the input." }
+        else                       { $id = $m[0].Id }
     }
     else {
-        $status = "EIM_MISMATCH"
-        $detail = "CMDB EIM(s) for $ba : $(Format-Short $baToEims[$nb])"
-        if ($eimToBas.ContainsKey($ne)) { $detail += "  |  EIM $eim is mapped in CMDB to BA ID(s): $(Format-Short $eimToBas[$ne])" }
-        else { $detail += "  |  EIM $eim is not in CMDB at all." }
+        $g = [guid]::Empty
+        if (-not [guid]::TryParse($id, [ref]$g)) { $err = "'$id' is not a valid subscription ID." }
+        elseif (-not $name -and $subById.ContainsKey($id.ToLower())) { $name = $subById[$id.ToLower()].Name }
     }
 
+    $values  = @{}; foreach ($t in $TagNames) { $values[$t] = "" }
+    $missing = @()   # tags not set at all
+    $empty   = @()   # tags set but with an empty value
+
+    if (-not $err) {
+        try {
+            $tags = Get-SubscriptionTags -SubId $id
+            foreach ($t in $TagNames) {
+                $tv = Get-TagValue -Tags $tags -Name $t
+                $values[$t] = $tv.Value
+                if (-not $tv.Exists)              { $missing += $t }
+                elseif (-not $tv.Value.Trim())    { $empty   += $t }
+            }
+        }
+        catch { $err = ($_.Exception.Message -split "`n")[0].Trim() }
+    }
+
+    $status = if ($err) { "ERROR" } elseif ($missing.Count -or $empty.Count) { "TAGS_MISSING" } else { "ALL_TAGS_PRESENT" }
+
     $results.Add([pscustomobject]@{
-        Row = $row.Row; SubscriptionName = $row.SubscriptionName; SubscriptionId = $row.SubscriptionId
-        BA = $ba; EIM = $eim; Status = $status; Detail = $detail
+        InputRow = $row.Row; Name = $name; Id = $id; Values = $values
+        Missing = $missing; Empty = $empty; Error = $err; Status = $status
     })
 
-    if ($status -eq "MATCH") { Write-Log "OK        $($row.SubscriptionName)  [$ba / $eim]" }
-    else { Write-Log "MISMATCH  $($row.SubscriptionName)  [$ba / $eim]  - $status" "Yellow" }
+    switch ($status) {
+        "ALL_TAGS_PRESENT" { Write-Log "OK        $name ($id)" }
+        "TAGS_MISSING"     {
+            $parts = @(); foreach ($t in $missing) { $parts += "$t (not set)" }; foreach ($t in $empty) { $parts += "$t (empty)" }
+            Write-Log "MISSING   $name ($id) - $($parts -join ', ')" "Yellow"
+        }
+        "ERROR"            { Write-Log "ERROR     $name ($id) - $err" "Red" }
+    }
 }
-Write-Progress -Activity "Checking BA ID / EIM against CMDB" -Completed
+Write-Progress -Activity "Reading subscription tags" -Completed
 
-# ---------- Final summary (all together) ----------
-$total   = $results.Count
-$matched = @($results | Where-Object Status -eq "MATCH").Count
-$bad     = @($results | Where-Object Status -ne "MATCH")
-$pct     = if ($total) { [math]::Round(($matched / $total) * 100, 2) } else { 0 }
+# ---------- Create the new Excel report ----------
+$saveError = $null
+$xl = $null; $wbOut = $null; $wsOut = $null
+try {
+    $rowsN  = $results.Count
+    $colsN  = 2 + $TagNames.Count
+    $arr    = New-Object 'object[,]' ($rowsN + 1), $colsN
+    $arr[0, 0] = "SubscriptionName"; $arr[0, 1] = "SubscriptionId"
+    for ($t = 0; $t -lt $TagNames.Count; $t++) { $arr[0, (2 + $t)] = $TagNames[$t] }
+    for ($r = 0; $r -lt $rowsN; $r++) {
+        $res = $results[$r]
+        $arr[($r + 1), 0] = $res.Name
+        $arr[($r + 1), 1] = $res.Id
+        for ($t = 0; $t -lt $TagNames.Count; $t++) { $arr[($r + 1), (2 + $t)] = $res.Values[$TagNames[$t]] }
+    }
+
+    $xl = New-Object -ComObject Excel.Application
+    $xl.Visible = $false
+    $xl.DisplayAlerts = $false
+    $wbOut = $xl.Workbooks.Add()
+    $wsOut = $wbOut.Worksheets.Item(1)
+    $wsOut.Name = "SubscriptionTags"
+
+    $rng = $wsOut.Range($wsOut.Cells.Item(1, 1), $wsOut.Cells.Item($rowsN + 1, $colsN))
+    $rng.NumberFormat = "@"          # keep every value as text (no number/leading-zero changes)
+    $rng.Value2 = $arr
+
+    # Header styling
+    $hdr = $wsOut.Range($wsOut.Cells.Item(1, 1), $wsOut.Cells.Item(1, $colsN))
+    $hdr.Font.Bold = $true
+    $hdr.Interior.Color = 15921906    # light grey
+
+    # Highlight: missing/empty tag cells = yellow, unreadable rows = light red
+    $yellow = 255 + (235 * 256) + (156 * 65536)
+    $red    = 255 + (199 * 256) + (206 * 65536)
+    for ($r = 0; $r -lt $rowsN; $r++) {
+        $res = $results[$r]; $xlRow = $r + 2
+        if ($res.Error) {
+            $wsOut.Range($wsOut.Cells.Item($xlRow, 1), $wsOut.Cells.Item($xlRow, $colsN)).Interior.Color = $red
+            continue
+        }
+        for ($t = 0; $t -lt $TagNames.Count; $t++) {
+            if ($res.Missing -contains $TagNames[$t] -or $res.Empty -contains $TagNames[$t]) {
+                $wsOut.Cells.Item($xlRow, (3 + $t)).Interior.Color = $yellow
+            }
+        }
+    }
+
+    try { [void]$wsOut.Range($wsOut.Cells.Item(1, 1), $wsOut.Cells.Item(1, $colsN)).AutoFilter() } catch {}
+    [void]$wsOut.Columns.AutoFit()
+
+    $wbOut.SaveAs($OutputPath, 51)    # 51 = .xlsx
+    Write-Log "Report saved: $OutputPath" "Green"
+}
+catch {
+    $saveError = $_.Exception.Message
+    Write-Log "ERROR: report could not be saved. $saveError" "Red"
+}
+finally {
+    if ($wsOut) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wsOut) }
+    if ($wbOut) { try { $wbOut.Close($false) } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wbOut) }
+    if ($xl)    { try { $xl.Quit() } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($xl) }
+}
+
+# ---------- Final summary (everything together) ----------
+$total    = $results.Count
+$okAll    = @($results | Where-Object Status -eq "ALL_TAGS_PRESENT")
+$missingS = @($results | Where-Object Status -eq "TAGS_MISSING")
+$errorS   = @($results | Where-Object Status -eq "ERROR")
+$readable = $total - $errorS.Count
 
 Write-Plain ""
 Write-Plain ("=" * 78)
-Write-Plain "  BA ID / EIM MAPPING SUMMARY   (subscription tags file vs CMDB file)"
+Write-Plain "  SUBSCRIPTION TAG REPORT SUMMARY   (tags: $($TagNames -join ', '))"
 Write-Plain ("=" * 78)
-Write-Plain "  Run time              : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-Write-Plain "  Subscriptions checked : $total"
-Write-Plain "  Matched CMDB mapping  : $matched" "Green"
-Write-Plain "  Not matching          : $($bad.Count)" $(if ($bad.Count) { "Yellow" } else { "Green" })
-Write-Plain "  Match rate            : $pct%"
+Write-Plain "  Run time                      : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Write-Plain "  Input file                    : $fullInput"
+Write-Plain "  Subscriptions processed       : $total"
+Write-Plain "  Having all 3 tags             : $($okAll.Count)"  "Green"
+Write-Plain "  Missing one or more tags      : $($missingS.Count)" $(if ($missingS.Count) { "Yellow" } else { "Green" })
+Write-Plain "  Could not be read (errors)    : $($errorS.Count)"   $(if ($errorS.Count)   { "Red" }    else { "Green" })
+if ($hiddenCount -gt 0) {
+    Write-Plain "  Rows hidden by input filter   : $hiddenCount ($(if ($VisibleRowsOnly) { 'skipped' } else { 'included' }))"
+}
 Write-Plain ("-" * 78)
 
-if ($matched -eq $total -and $total -gt 0) {
-    Write-Plain "  RESULT: 100% MATCH - every BA ID + EIM pair in the tags file exists in the CMDB mapping." "Green"
+Write-Plain "  Tag coverage (of $readable readable subscriptions):"
+foreach ($t in $TagNames) {
+    $set = @($results | Where-Object { -not $_.Error -and ($_.Missing -notcontains $t) -and ($_.Empty -notcontains $t) }).Count
+    $notSet = @($results | Where-Object { -not $_.Error -and $_.Missing -contains $t }).Count
+    $emp    = @($results | Where-Object { -not $_.Error -and $_.Empty -contains $t }).Count
+    Write-Plain ("    {0,-8} present: {1,-5} not set: {2,-5} empty value: {3}" -f $t, $set, $notSet, $emp)
+}
+Write-Plain ("-" * 78)
+
+if ($total -gt 0 -and $okAll.Count -eq $total) {
+    Write-Plain "  RESULT: 100% - every subscription has all three tags (BA ID, EIM, EHC ID)." "Green"
 }
 else {
-    Write-Plain "  RESULT: NOT A 100% MATCH - $($bad.Count) subscription(s) need attention." "Red"
+    Write-Plain "  RESULT: NOT ALL SUBSCRIPTIONS HAVE ALL THREE TAGS - $($missingS.Count + $errorS.Count) need attention." "Red"
 
-    Write-Plain ""
-    Write-Plain "  Issue breakdown:"
-    $bad | Group-Object Status | Sort-Object Name | ForEach-Object {
-        Write-Plain ("    {0,-26} {1}" -f $_.Name, $_.Count)
+    if ($missingS.Count -gt 0) {
+        Write-Plain ""
+        Write-Plain "  SUBSCRIPTIONS MISSING TAG(S) ($($missingS.Count)):" "Yellow"
+        foreach ($m in $missingS) {
+            Write-Plain ""
+            Write-Plain "  * $($m.Name)   (input row $($m.InputRow))"
+            Write-Plain "    ID      : $($m.Id)"
+            if ($m.Missing.Count) { Write-Plain "    Not set : $($m.Missing -join ', ')" }
+            if ($m.Empty.Count)   { Write-Plain "    Empty   : $($m.Empty -join ', ')" }
+            $have = @(); foreach ($t in $TagNames) { if ($m.Missing -notcontains $t -and $m.Empty -notcontains $t) { $have += "$t=$($m.Values[$t])" } }
+            Write-Plain "    Has     : $(if ($have.Count) { $have -join ',  ' } else { '(none of the three tags)' })"
+        }
     }
 
-    $pairCount = @($bad | Group-Object { "$($_.BA)|$($_.EIM)" }).Count
-    Write-Plain "    (distinct BA ID / EIM pairs involved: $pairCount)"
-
-    Write-Plain ""
-    Write-Plain "  NON-MATCHING SUBSCRIPTIONS ($($bad.Count)):" "Yellow"
-    foreach ($g in ($bad | Group-Object Status | Sort-Object Name)) {
+    if ($errorS.Count -gt 0) {
         Write-Plain ""
-        Write-Plain "  --- $($g.Name) ($($g.Count)) ---" "Yellow"
-        foreach ($b in $g.Group) {
-            Write-Plain ""
-            Write-Plain "  * $($b.SubscriptionName)   (Excel row $($b.Row))"
-            Write-Plain "    ID    : $($b.SubscriptionId)"
-            Write-Plain "    Tags file : BA ID='$($b.BA)'  EIM='$($b.EIM)'"
-            Write-Plain "    Detail    : $($b.Detail)"
+        Write-Plain "  COULD NOT BE READ ($($errorS.Count)) - check name/ID, access or tenant:" "Red"
+        foreach ($e in $errorS) {
+            Write-Plain "  * $($e.Name)   (input row $($e.InputRow))  [$($e.Id)]"
+            Write-Plain "    $($e.Error)"
         }
     }
 }
+
 Write-Plain ""
-Write-Plain ("=" * 78)
-Write-Plain "  No files were created or modified. Both Excel workbooks left untouched."
-Write-Plain "  No Azure connection was used."
+Write-Plain ("-" * 78)
+if ($saveError) { Write-Plain "  REPORT FILE: NOT SAVED - $saveError" "Red" }
+else {
+    Write-Plain "  Report file : $OutputPath"
+    Write-Plain "  (yellow cells = tag not set or empty; light red rows = subscription could not be read)"
+}
+Write-Plain "  Azure: read-only. Input workbook untouched. No log file written."
 Write-Plain ("=" * 78)
