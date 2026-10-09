@@ -1,28 +1,29 @@
 <#
 .SYNOPSIS
-  Validates the "BA ID" (column C) and "EIM" (column D) values in your OPEN
-  Excel workbook against the live tags on each Azure subscription
+  Validates the "BA ID" (column C) and "EIM" (column D) values in your
+  Excel workbook (path set in -ExcelPath below) against the live tags on each Azure subscription
   (column A = name, column B = subscription ID).
 
   READ-ONLY and FILE-FREE:
-    - Reads the already-open workbook through Excel (nothing is saved, edited or closed).
+    - Opens the workbook READ-ONLY through Excel (nothing is saved or edited).
     - Reads tags from Azure with Get-AzTag (GET only).
     - Writes NOTHING to disk. All logs and the final summary print on screen.
 
 .PREREQUISITES
-  - Use Windows PowerShell 5.1 (the blue "Windows PowerShell" window), not PowerShell 7.
-  - Run PowerShell and Excel at the same privilege level (both normal, not "as administrator").
+  - Microsoft Excel installed on this machine.
   - Az modules:  Install-Module Az.Accounts, Az.Resources -Scope CurrentUser
   - Sign in:     Connect-AzAccount
-  - Open Stage1Analysis-TagsMapping.xlsx in Excel and make sure no cell is in edit mode.
 
 .USAGE
-  .\Verify-SubscriptionTags-NoFiles.ps1
+  1. Set the path on the $ExcelPath line below (or pass -ExcelPath).
+  2. .\Verify-SubscriptionTags-NoFiles.ps1
+  The workbook may be open or closed in Excel; both work.
 #>
 
 [CmdletBinding()]
 param(
-    [string]$WorkbookName = "Stage1Analysis-TagsMapping",
+    # >>> SET YOUR EXCEL FILE PATH HERE <<<
+    [string]$ExcelPath    = "C:\Path\To\Stage1Analysis-TagsMapping.xlsx",
     [string]$SheetName    = "Sheet1",
     [int]$MaxRetries      = 3
 )
@@ -40,38 +41,52 @@ function Write-Plain {
 }
 
 # ---------- Pre-flight ----------
-if ($PSVersionTable.PSEdition -eq "Core") {
-    throw "This script needs Windows PowerShell 5.1 (not PowerShell 7) to talk to the open Excel window."
-}
 if (-not (Get-Module -ListAvailable -Name Az.Resources)) {
     throw "Az.Resources module not found. Run: Install-Module Az.Accounts, Az.Resources -Scope CurrentUser"
 }
 if (-not (Get-AzContext)) { throw "Not signed in to Azure. Run Connect-AzAccount first." }
 
-# ---------- Read the OPEN workbook (read-only) ----------
-$excel = $null
-try { $excel = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application") }
-catch { throw "Excel is not running (or runs at a different privilege level). Open $WorkbookName.xlsx in Excel and retry." }
-
-$wb = $null
-foreach ($w in $excel.Workbooks) {
-    if ($w.Name -like "$WorkbookName*") { $wb = $w; break }
+# ---------- Read the workbook (read-only) ----------
+if (-not (Test-Path -LiteralPath $ExcelPath)) {
+    throw "Excel file not found: $ExcelPath  (set the correct path in -ExcelPath)"
 }
-if (-not $wb) {
-    $open = @(foreach ($w in $excel.Workbooks) { $w.Name }) -join ", "
-    throw "Workbook '$WorkbookName' is not open in Excel. Open workbooks: $open"
+$fullPath = (Resolve-Path -LiteralPath $ExcelPath).Path
+
+$excel = $null; $wb = $null; $ws = $null; $ownsExcel = $false
+
+# If the file is already open in a running Excel, read it from there
+$running = $null
+try { $running = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application") } catch { $running = $null }
+if ($running) {
+    foreach ($w in $running.Workbooks) {
+        if ($w.FullName -ieq $fullPath) { $wb = $w; $excel = $running; break }
+    }
 }
 
 try {
+    if (-not $wb) {
+        # Otherwise open it READ-ONLY in a separate, hidden Excel instance
+        $excel = New-Object -ComObject Excel.Application
+        $excel.Visible = $false
+        $excel.DisplayAlerts = $false
+        $ownsExcel = $true
+        $wb = $excel.Workbooks.Open($fullPath, 0, $true)    # UpdateLinks=0, ReadOnly=true
+    }
     $ws   = $wb.Worksheets.Item($SheetName)
-    $data = $ws.UsedRange.Value2          # one-shot read into a 2D array; changes nothing
+    $data = $ws.UsedRange.Value2                            # one-shot read; changes nothing
 }
 catch {
-    throw "Could not read sheet '$SheetName'. Make sure no cell is being edited in Excel. $($_.Exception.Message)"
+    throw "Could not read sheet '$SheetName' from '$fullPath'. If the file is open, make sure no cell is in edit mode. $($_.Exception.Message)"
 }
 finally {
     if ($ws) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ws) }
+    if ($ownsExcel) {
+        # Close WITHOUT saving; only our own hidden instance is quit
+        if ($wb)    { try { $wb.Close($false) } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wb) }
+        if ($excel) { try { $excel.Quit() } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
+    }
 }
+$workbookLabel = Split-Path $fullPath -Leaf
 
 if ($data -isnot [object[,]]) { throw "Sheet '$SheetName' does not contain a data table." }
 
@@ -109,7 +124,7 @@ $rows = for ($r = 2; $r -le $rowCount; $r++) {
 $rows = @($rows)
 
 Write-Log "Starting tag verification (read-only, no files written)"
-Write-Log "Workbook   : $($wb.Name)  |  Sheet: $SheetName"
+Write-Log "Workbook   : $workbookLabel  |  Sheet: $SheetName"
 Write-Log "Azure acct : $((Get-AzContext).Account.Id)"
 Write-Log "Subscriptions to check: $($rows.Count)"
 
