@@ -1,5 +1,1 @@
-A Microsoft Entra audit log entry shows that the authenticator app registration was removed for account 45150223-msa@hsbc.com.
 
-	•	The MsGraphPhoneAppDetail properties (registration ID, device name RMX5116, device tag SoftwareTokenActivated, app version 6.2608.5658) changed from populated values to empty.
-	•	The entry has InitiatedFrom: My Signins.
-	•	The reason for the change has not been determined.
