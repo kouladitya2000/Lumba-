@@ -1,55 +1,40 @@
 <#
 .SYNOPSIS
-  Builds a NEW Excel report of subscription tags.
+  Sanity check for the report created by 1-Generate-SubscriptionTagsReport.ps1.
 
-  INPUT : an Excel file with subscription name (column A) and/or subscription ID (column B).
-  OUTPUT: a new .xlsx with columns
-            SubscriptionName | SubscriptionId | BA ID | EIM | EHC ID
-          (the last three are the live Azure subscription tags).
+  Re-reads the live Azure tags for every subscription in the report and confirms that
+  BA ID, EIM and EHC ID in the report are EXACTLY what is on the live subscription.
+  (It also confirms the subscription name in the report equals the live name.)
 
-  Logging: everything prints on screen (no log file). At the end you get ONE summary
-  that lists every subscription missing any of the three tags, plus any subscription
-  that could not be read.
-
-.READ-ONLY GUARANTEE
-  - Azure   : only reads (Get-AzSubscription, Get-AzTag). Nothing in Azure is changed.
-  - Input   : the input workbook is only read, never saved or edited.
-  - The ONLY file written is the new report .xlsx (never overwrites an existing file).
+  READ-ONLY and FILE-FREE:
+    - Report workbook is opened read-only (nothing saved or edited).
+    - Azure: only reads (Get-AzSubscription, Get-AzTag). Nothing is changed.
+    - Writes NOTHING to disk. Logs and the final summary print on screen.
 
 .PREREQUISITES
-  - Microsoft Excel installed (used to read the input and write the report; no extra modules).
+  - Microsoft Excel installed (to read the report; no extra modules).
   - Install-Module Az.Accounts, Az.Resources -Scope CurrentUser
   - Connect-AzAccount
 
 .USAGE
-  1. Set $InputExcelPath below (or pass -InputExcelPath).
-  2. Run the script. The report is saved next to the input file unless you set -OutputPath.
-
-  Name only / ID only rows are fine: a missing ID is looked up from the name,
-  and a missing name is filled in from the ID.
-
-  If your input sheet has an active filter (e.g. "251 of 254 records found"), hidden rows are
-  INCLUDED by default. Add -VisibleRowsOnly to process only the rows you can see.
+  1. Set $ReportExcelPath below to the report created by script 1 (or pass -ReportExcelPath).
+  2. Run the script. The report can be open or closed in Excel.
 #>
 
 [CmdletBinding()]
 param(
-    # >>> SET YOUR INPUT FILE PATH HERE <<<
-    [string]$InputExcelPath = "C:\Path\To\Your-Subscriptions-List.xlsx",
-    [string]$SheetName      = "Sheet1",
-    [string]$NameHeader     = "SubscriptionName",
-    [string]$IdHeader       = "SubscriptionId",
+    # >>> SET THE PATH OF THE REPORT CREATED BY SCRIPT 1 <<<
+    [string]$ReportExcelPath = "C:\Path\To\SubscriptionTagsReport.xlsx",
 
-    # Leave blank to save next to the input file as SubscriptionTagsReport_<timestamp>.xlsx
-    [string]$OutputPath     = "",
+    # Leave blank to use the first sheet (script 1 names it "SubscriptionTags")
+    [string]$SheetName       = "",
 
-    [switch]$VisibleRowsOnly,
-    [int]$MaxRetries        = 3
+    [int]$MaxRetries         = 3
 )
 
 $ErrorActionPreference = "Stop"
 
-# Tags to collect (this order = column order in the report)
+# Report column header -> Azure tag name
 $TagNames = @("BA ID", "EIM", "EHC ID")
 
 function Write-Log {
@@ -67,33 +52,22 @@ if (-not (Get-Module -ListAvailable -Name Az.Resources)) {
     throw "Az.Resources module not found. Run: Install-Module Az.Accounts, Az.Resources -Scope CurrentUser"
 }
 if (-not (Get-AzContext)) { throw "Not signed in to Azure. Run Connect-AzAccount first." }
-if (-not (Test-Path -LiteralPath $InputExcelPath)) {
-    throw "Input file not found: $InputExcelPath  (set the correct path at the top of the script)"
+if (-not (Test-Path -LiteralPath $ReportExcelPath)) {
+    throw "Report file not found: $ReportExcelPath  (set the correct path at the top of the script)"
 }
-$fullInput = (Resolve-Path -LiteralPath $InputExcelPath).Path
+$fullReport = (Resolve-Path -LiteralPath $ReportExcelPath).Path
 
-$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-if (-not $OutputPath) {
-    $OutputPath = Join-Path (Split-Path -Parent $fullInput) "SubscriptionTagsReport_$stamp.xlsx"
-}
-if ([IO.Path]::GetExtension($OutputPath).ToLower() -ne ".xlsx") { throw "-OutputPath must end with .xlsx" }
-$outDir = Split-Path -Parent $OutputPath
-if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { throw "Output folder does not exist: $outDir" }
-if (Test-Path -LiteralPath $OutputPath) { throw "Output file already exists (not overwriting): $OutputPath" }
-
-# ---------- Excel helpers ----------
+# ---------- Excel helpers (read-only) ----------
 function ConvertTo-CellString($v) {
     if ($null -eq $v) { return "" }
     if ($v -is [double]) { return $v.ToString("0.##########", [Globalization.CultureInfo]::InvariantCulture) }
     return [string]$v
 }
 
-function Read-InputSheet {
-    # Reads the sheet read-only. Returns the cell values and which data rows are hidden by a filter.
+function Get-SheetData {
     param([string]$FullPath, [string]$Sheet)
 
-    $excel = $null; $wb = $null; $ws = $null; $ur = $null
-    $own = $false; $running = $null; $data = $null; $hidden = @{}
+    $excel = $null; $wb = $null; $ws = $null; $own = $false; $running = $null; $data = $null
 
     try { $running = [Runtime.InteropServices.Marshal]::GetActiveObject("Excel.Application") } catch { $running = $null }
     if ($running) {
@@ -110,83 +84,63 @@ function Read-InputSheet {
             $own = $true
             $wb = $excel.Workbooks.Open($FullPath, 0, $true)      # UpdateLinks=0, ReadOnly=true
         }
-        $ws = if ($Sheet) { $wb.Worksheets.Item($Sheet) } else { $wb.Worksheets.Item(1) }
-        $ur = $ws.UsedRange
-        $data = $ur.Value2
-        $firstRow = [int]$ur.Row
-        if ($data -is [object[,]]) {
-            $n = $data.GetLength(0)
-            for ($k = 2; $k -le $n; $k++) {
-                if ([bool]$ws.Rows.Item($firstRow + $k - 1).Hidden) { $hidden[$k] = $true }
-            }
-        }
+        $ws   = if ($Sheet) { $wb.Worksheets.Item($Sheet) } else { $wb.Worksheets.Item(1) }
+        $data = $ws.UsedRange.Value2
     }
     catch {
-        throw "Could not read sheet '$Sheet' from '$FullPath'. If the file is open, make sure no cell is in edit mode. $($_.Exception.Message)"
+        throw "Could not read the report sheet from '$FullPath'. If it is open, make sure no cell is in edit mode. $($_.Exception.Message)"
     }
     finally {
-        if ($ur) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ur) }
         if ($ws) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ws) }
         if ($own) {
             if ($wb)    { try { $wb.Close($false) } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wb) }
             if ($excel) { try { $excel.Quit() } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($excel) }
         }
     }
-    return @{ Data = $data; Hidden = $hidden }
+    if ($data -isnot [object[,]]) { return $null }
+    return ,$data
 }
 
-# ---------- Read the input list ----------
-Write-Log "Starting subscription tag report (Azure access is read-only)"
-Write-Log "Reading input list: $fullInput"
-$in   = Read-InputSheet -FullPath $fullInput -Sheet $SheetName
-$data = $in.Data
-if ($data -isnot [object[,]]) { throw "The input sheet is empty." }
+# ---------- Read the report ----------
+Write-Log "Starting validation of the generated report against LIVE Azure tags (read-only, no files written)"
+Write-Log "Report     : $fullReport"
+Write-Log "Azure acct : $((Get-AzContext).Account.Id)"
+
+$data = Get-SheetData -FullPath $fullReport -Sheet $SheetName
+if (-not $data) { throw "The report sheet is empty." }
 
 $col = @{}
 for ($c = 1; $c -le $data.GetLength(1); $c++) {
     $h = (ConvertTo-CellString $data[1, $c]).Trim()
     if ($h -and -not $col.ContainsKey($h)) { $col[$h] = $c }
 }
-foreach ($h in @($NameHeader, $IdHeader)) {
-    if (-not $col.ContainsKey($h)) { throw "Header '$h' not found in row 1. Headers found: $($col.Keys -join ', ')" }
+foreach ($h in (@("SubscriptionName", "SubscriptionId") + $TagNames)) {
+    if (-not $col.ContainsKey($h)) { throw "Header '$h' not found in row 1 of the report. Headers found: $($col.Keys -join ', ')" }
 }
 
-$inputRows   = New-Object System.Collections.Generic.List[object]
-$hiddenCount = 0
-$skippedHidden = 0
-for ($r = 2; $r -le $data.GetLength(0); $r++) {
-    $n  = (ConvertTo-CellString $data[$r, $col[$NameHeader]]).Trim()
-    $id = (ConvertTo-CellString $data[$r, $col[$IdHeader]]).Trim()
-    if (-not $n -and -not $id) { continue }
-    $isHidden = $in.Hidden.ContainsKey($r)
-    if ($isHidden) { $hiddenCount++ }
-    if ($isHidden -and $VisibleRowsOnly) { $skippedHidden++; continue }
-    $inputRows.Add([pscustomobject]@{ Row = $r; Name = $n; Id = $id })
+$rows = for ($r = 2; $r -le $data.GetLength(0); $r++) {
+    $name = (ConvertTo-CellString $data[$r, $col["SubscriptionName"]]).Trim()
+    $id   = (ConvertTo-CellString $data[$r, $col["SubscriptionId"]]).Trim()
+    if (-not $name -and -not $id) { continue }
+    $vals = @{}
+    foreach ($t in $TagNames) { $vals[$t] = ConvertTo-CellString $data[$r, $col[$t]] }   # exact, not trimmed
+    [pscustomobject]@{ Row = $r; Name = $name; Id = $id; Values = $vals }
 }
-if ($inputRows.Count -eq 0) { throw "No subscription rows found in the input sheet." }
+$rows = @($rows)
+if ($rows.Count -eq 0) { throw "No subscription rows found in the report." }
+Write-Log "Subscriptions in report: $($rows.Count)"
 
-Write-Log "Input rows to process: $($inputRows.Count)"
-if ($hiddenCount -gt 0) {
-    if ($VisibleRowsOnly) { Write-Log "NOTE: $hiddenCount row(s) are hidden by a filter and were SKIPPED (-VisibleRowsOnly)." "Yellow" }
-    else { Write-Log "NOTE: $hiddenCount row(s) are hidden by a filter and are INCLUDED. Use -VisibleRowsOnly to skip them." "Yellow" }
-}
+$dupes = $rows | Where-Object { $_.Id } | Group-Object { $_.Id.ToLower() } | Where-Object Count -gt 1
+foreach ($d in $dupes) { Write-Log "WARNING: duplicate subscription ID in report: $($d.Name) ($($d.Count) rows)" "Yellow" }
 
-$dupes = $inputRows | Where-Object { $_.Id } | Group-Object { $_.Id.ToLower() } | Where-Object Count -gt 1
-foreach ($d in $dupes) { Write-Log "WARNING: duplicate subscription ID in input: $($d.Name) ($($d.Count) rows)" "Yellow" }
-
-# ---------- Azure subscription lookup (read-only) ----------
-$subById = @{}; $subByName = @{}
+# ---------- Live subscription names (read-only) ----------
+$subById = @{}
 try {
-    foreach ($s in @(Get-AzSubscription -ErrorAction Stop)) {
-        $subById[$s.Id.ToLower()] = $s
-        $k = $s.Name.ToLower()
-        if (-not $subByName.ContainsKey($k)) { $subByName[$k] = New-Object System.Collections.Generic.List[object] }
-        $subByName[$k].Add($s)
-    }
+    foreach ($s in @(Get-AzSubscription -ErrorAction Stop)) { $subById[$s.Id.ToLower()] = $s.Name }
     Write-Log "Accessible subscriptions found in Azure: $($subById.Count)"
 }
 catch {
-    Write-Log "WARNING: could not list subscriptions ($(($_.Exception.Message -split "`n")[0])). Rows with only a name cannot be resolved." "Yellow"
+    Write-Log "WARNING: could not list subscriptions ($(($_.Exception.Message -split "`n")[0])). Subscription NAMES will not be verified; tags still are." "Yellow"
 }
 
 # ---------- Helpers ----------
@@ -207,7 +161,6 @@ function Get-SubscriptionTags {
 }
 
 function Get-TagValue {
-    # Azure tag NAMES are case-insensitive
     param($Tags, [string]$Name)
     if (-not $Tags) { return @{ Exists = $false; Value = "" } }
     foreach ($k in $Tags.Keys) {
@@ -216,195 +169,126 @@ function Get-TagValue {
     return @{ Exists = $false; Value = "" }
 }
 
+function Compare-TagValue {
+    param([string]$Report, [bool]$AzureExists, [string]$Azure)
+
+    if ($Report -ceq $Azure) { return "MATCH" }          # includes: report blank + tag not set/empty in Azure
+    if (-not $AzureExists)   { return "TAG_MISSING_IN_AZURE" }      # report has a value, Azure has no such tag
+    if ([string]::IsNullOrEmpty($Report))  { return "BLANK_IN_REPORT" }   # Azure has a value, report cell blank
+    if ([string]::IsNullOrEmpty($Azure))   { return "TAG_EMPTY_IN_AZURE" }
+    if ($Report.Trim() -ceq $Azure.Trim()) { return "WHITESPACE_DIFFERENCE" }
+    if ($Report.Trim() -ieq $Azure.Trim()) { return "CASE_DIFFERENCE" }
+    return "VALUE_MISMATCH"
+}
+
 # ---------- Main loop ----------
 $results = New-Object System.Collections.Generic.List[object]
 $i = 0
 
-foreach ($row in $inputRows) {
+foreach ($row in $rows) {
     $i++
-    $name = $row.Name; $id = $row.Id; $err = $null
+    Write-Progress -Activity "Validating report against live Azure tags" -Status "$i of $($rows.Count): $($row.Name)" -PercentComplete (($i / $rows.Count) * 100)
 
-    Write-Progress -Activity "Reading subscription tags" -Status "$i of $($inputRows.Count): $name $id" -PercentComplete (($i / $inputRows.Count) * 100)
+    $issues = @()
+    $err = $null
+    $tags = $null
 
-    # Resolve ID from name / name from ID
-    if (-not $id) {
-        $m = $subByName[$name.ToLower()]
-        if (-not $m)               { $err = "Subscription name not found in accessible subscriptions (cannot resolve ID)." }
-        elseif ($m.Count -gt 1)    { $err = "Subscription name matches $($m.Count) subscriptions; add the subscription ID to the input." }
-        else                       { $id = $m[0].Id }
-    }
+    $g = [guid]::Empty
+    if (-not $row.Id)                                  { $err = "No subscription ID in the report row." }
+    elseif (-not [guid]::TryParse($row.Id, [ref]$g))   { $err = "'$($row.Id)' is not a valid subscription ID." }
     else {
-        $g = [guid]::Empty
-        if (-not [guid]::TryParse($id, [ref]$g)) { $err = "'$id' is not a valid subscription ID." }
-        elseif (-not $name -and $subById.ContainsKey($id.ToLower())) { $name = $subById[$id.ToLower()].Name }
-    }
-
-    $values  = @{}; foreach ($t in $TagNames) { $values[$t] = "" }
-    $missing = @()   # tags not set at all
-    $empty   = @()   # tags set but with an empty value
-
-    if (-not $err) {
-        try {
-            $tags = Get-SubscriptionTags -SubId $id
-            foreach ($t in $TagNames) {
-                $tv = Get-TagValue -Tags $tags -Name $t
-                $values[$t] = $tv.Value
-                if (-not $tv.Exists)              { $missing += $t }
-                elseif (-not $tv.Value.Trim())    { $empty   += $t }
-            }
-        }
+        try { $tags = Get-SubscriptionTags -SubId $row.Id }
         catch { $err = ($_.Exception.Message -split "`n")[0].Trim() }
     }
 
-    $status = if ($err) { "ERROR" } elseif ($missing.Count -or $empty.Count) { "TAGS_MISSING" } else { "ALL_TAGS_PRESENT" }
-
-    $results.Add([pscustomobject]@{
-        InputRow = $row.Row; Name = $name; Id = $id; Values = $values
-        Missing = $missing; Empty = $empty; Error = $err; Status = $status
-    })
-
-    switch ($status) {
-        "ALL_TAGS_PRESENT" { Write-Log "OK        $name ($id)" }
-        "TAGS_MISSING"     {
-            $parts = @(); foreach ($t in $missing) { $parts += "$t (not set)" }; foreach ($t in $empty) { $parts += "$t (empty)" }
-            Write-Log "MISSING   $name ($id) - $($parts -join ', ')" "Yellow"
+    if (-not $err) {
+        # Subscription name check (only if the live name is known)
+        $key = $row.Id.ToLower()
+        if ($subById.ContainsKey($key) -and ($row.Name -cne $subById[$key])) {
+            $issues += [pscustomobject]@{ Tag = "SubscriptionName"; Issue = "NAME_MISMATCH"; ReportValue = $row.Name; AzureValue = $subById[$key] }
         }
-        "ERROR"            { Write-Log "ERROR     $name ($id) - $err" "Red" }
-    }
-}
-Write-Progress -Activity "Reading subscription tags" -Completed
-
-# ---------- Create the new Excel report ----------
-$saveError = $null
-$xl = $null; $wbOut = $null; $wsOut = $null
-try {
-    $rowsN  = $results.Count
-    $colsN  = 2 + $TagNames.Count
-    $arr    = New-Object 'object[,]' ($rowsN + 1), $colsN
-    $arr[0, 0] = "SubscriptionName"; $arr[0, 1] = "SubscriptionId"
-    for ($t = 0; $t -lt $TagNames.Count; $t++) { $arr[0, (2 + $t)] = $TagNames[$t] }
-    for ($r = 0; $r -lt $rowsN; $r++) {
-        $res = $results[$r]
-        $arr[($r + 1), 0] = $res.Name
-        $arr[($r + 1), 1] = $res.Id
-        for ($t = 0; $t -lt $TagNames.Count; $t++) { $arr[($r + 1), (2 + $t)] = $res.Values[$TagNames[$t]] }
-    }
-
-    $xl = New-Object -ComObject Excel.Application
-    $xl.Visible = $false
-    $xl.DisplayAlerts = $false
-    $wbOut = $xl.Workbooks.Add()
-    $wsOut = $wbOut.Worksheets.Item(1)
-    $wsOut.Name = "SubscriptionTags"
-
-    $rng = $wsOut.Range($wsOut.Cells.Item(1, 1), $wsOut.Cells.Item($rowsN + 1, $colsN))
-    $rng.NumberFormat = "@"          # keep every value as text (no number/leading-zero changes)
-    $rng.Value2 = $arr
-
-    # Header styling
-    $hdr = $wsOut.Range($wsOut.Cells.Item(1, 1), $wsOut.Cells.Item(1, $colsN))
-    $hdr.Font.Bold = $true
-    $hdr.Interior.Color = 15921906    # light grey
-
-    # Highlight: missing/empty tag cells = yellow, unreadable rows = light red
-    $yellow = 255 + (235 * 256) + (156 * 65536)
-    $red    = 255 + (199 * 256) + (206 * 65536)
-    for ($r = 0; $r -lt $rowsN; $r++) {
-        $res = $results[$r]; $xlRow = $r + 2
-        if ($res.Error) {
-            $wsOut.Range($wsOut.Cells.Item($xlRow, 1), $wsOut.Cells.Item($xlRow, $colsN)).Interior.Color = $red
-            continue
-        }
-        for ($t = 0; $t -lt $TagNames.Count; $t++) {
-            if ($res.Missing -contains $TagNames[$t] -or $res.Empty -contains $TagNames[$t]) {
-                $wsOut.Cells.Item($xlRow, (3 + $t)).Interior.Color = $yellow
+        foreach ($t in $TagNames) {
+            $az     = Get-TagValue -Tags $tags -Name $t
+            $status = Compare-TagValue -Report $row.Values[$t] -AzureExists $az.Exists -Azure $az.Value
+            if ($status -ne "MATCH") {
+                $issues += [pscustomobject]@{
+                    Tag = $t; Issue = $status; ReportValue = $row.Values[$t]
+                    AzureValue = if ($az.Exists) { $az.Value } else { "<tag not set>" }
+                }
             }
         }
     }
 
-    try { [void]$wsOut.Range($wsOut.Cells.Item(1, 1), $wsOut.Cells.Item(1, $colsN)).AutoFilter() } catch {}
-    [void]$wsOut.Columns.AutoFit()
+    $overall = if ($err) { "ERROR" } elseif ($issues.Count -eq 0) { "MATCH" } else { "MISMATCH" }
+    $detail  = if ($err) { $err } else { ($issues | ForEach-Object { "$($_.Tag): $($_.Issue)" }) -join "; " }
 
-    $wbOut.SaveAs($OutputPath, 51)    # 51 = .xlsx
-    Write-Log "Report saved: $OutputPath" "Green"
+    $results.Add([pscustomobject]@{
+        Row = $row.Row; Name = $row.Name; Id = $row.Id; Status = $overall; Detail = $detail; Issues = $issues; Error = $err
+    })
+
+    switch ($overall) {
+        "MATCH"    { Write-Log "OK        $($row.Name) ($($row.Id))" }
+        "ERROR"    { Write-Log "ERROR     $($row.Name) ($($row.Id)) - $err" "Red" }
+        "MISMATCH" { Write-Log "MISMATCH  $($row.Name) ($($row.Id)) - $detail" "Yellow" }
+    }
 }
-catch {
-    $saveError = $_.Exception.Message
-    Write-Log "ERROR: report could not be saved. $saveError" "Red"
-}
-finally {
-    if ($wsOut) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wsOut) }
-    if ($wbOut) { try { $wbOut.Close($false) } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($wbOut) }
-    if ($xl)    { try { $xl.Quit() } catch {} ; [void][Runtime.InteropServices.Marshal]::ReleaseComObject($xl) }
-}
+Write-Progress -Activity "Validating report against live Azure tags" -Completed
 
 # ---------- Final summary (everything together) ----------
 $total    = $results.Count
-$okAll    = @($results | Where-Object Status -eq "ALL_TAGS_PRESENT")
-$missingS = @($results | Where-Object Status -eq "TAGS_MISSING")
-$errorS   = @($results | Where-Object Status -eq "ERROR")
-$readable = $total - $errorS.Count
+$matched  = @($results | Where-Object Status -eq "MATCH").Count
+$mismatch = @($results | Where-Object Status -eq "MISMATCH")
+$errored  = @($results | Where-Object Status -eq "ERROR")
+$pct      = if ($total) { [math]::Round(($matched / $total) * 100, 2) } else { 0 }
 
 Write-Plain ""
 Write-Plain ("=" * 78)
-Write-Plain "  SUBSCRIPTION TAG REPORT SUMMARY   (tags: $($TagNames -join ', '))"
+Write-Plain "  REPORT vs LIVE AZURE VALIDATION SUMMARY   (tags: $($TagNames -join ', '))"
 Write-Plain ("=" * 78)
-Write-Plain "  Run time                      : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-Write-Plain "  Input file                    : $fullInput"
-Write-Plain "  Subscriptions processed       : $total"
-Write-Plain "  Having all 3 tags             : $($okAll.Count)"  "Green"
-Write-Plain "  Missing one or more tags      : $($missingS.Count)" $(if ($missingS.Count) { "Yellow" } else { "Green" })
-Write-Plain "  Could not be read (errors)    : $($errorS.Count)"   $(if ($errorS.Count)   { "Red" }    else { "Green" })
-if ($hiddenCount -gt 0) {
-    Write-Plain "  Rows hidden by input filter   : $hiddenCount ($(if ($VisibleRowsOnly) { 'skipped' } else { 'included' }))"
-}
+Write-Plain "  Run time              : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Write-Plain "  Report file           : $fullReport"
+Write-Plain "  Subscriptions checked : $total"
+Write-Plain "  Matched live Azure    : $matched" "Green"
+Write-Plain "  Mismatched            : $($mismatch.Count)" $(if ($mismatch.Count) { "Yellow" } else { "Green" })
+Write-Plain "  Errors (not verified) : $($errored.Count)"  $(if ($errored.Count)  { "Red" }    else { "Green" })
+Write-Plain "  Match rate            : $pct%"
 Write-Plain ("-" * 78)
 
-Write-Plain "  Tag coverage (of $readable readable subscriptions):"
-foreach ($t in $TagNames) {
-    $set = @($results | Where-Object { -not $_.Error -and ($_.Missing -notcontains $t) -and ($_.Empty -notcontains $t) }).Count
-    $notSet = @($results | Where-Object { -not $_.Error -and $_.Missing -contains $t }).Count
-    $emp    = @($results | Where-Object { -not $_.Error -and $_.Empty -contains $t }).Count
-    Write-Plain ("    {0,-8} present: {1,-5} not set: {2,-5} empty value: {3}" -f $t, $set, $notSet, $emp)
-}
-Write-Plain ("-" * 78)
-
-if ($total -gt 0 -and $okAll.Count -eq $total) {
-    Write-Plain "  RESULT: 100% - every subscription has all three tags (BA ID, EIM, EHC ID)." "Green"
+if ($total -gt 0 -and $matched -eq $total) {
+    Write-Plain "  RESULT: 100% MATCH - every name and tag value in the report equals the live Azure subscription." "Green"
 }
 else {
-    Write-Plain "  RESULT: NOT ALL SUBSCRIPTIONS HAVE ALL THREE TAGS - $($missingS.Count + $errorS.Count) need attention." "Red"
+    Write-Plain "  RESULT: NOT A 100% MATCH - $($mismatch.Count + $errored.Count) subscription(s) need attention." "Red"
 
-    if ($missingS.Count -gt 0) {
+    if ($mismatch.Count -gt 0) {
         Write-Plain ""
-        Write-Plain "  SUBSCRIPTIONS MISSING TAG(S) ($($missingS.Count)):" "Yellow"
-        foreach ($m in $missingS) {
+        Write-Plain "  Issue breakdown:"
+        $mismatch | ForEach-Object { $_.Issues } | Group-Object Tag, Issue | Sort-Object Name |
+            ForEach-Object { Write-Plain ("    {0,-40} {1}" -f $_.Name, $_.Count) }
+
+        Write-Plain ""
+        Write-Plain "  MISMATCHED SUBSCRIPTIONS ($($mismatch.Count)):" "Yellow"
+        foreach ($m in $mismatch) {
             Write-Plain ""
-            Write-Plain "  * $($m.Name)   (input row $($m.InputRow))"
-            Write-Plain "    ID      : $($m.Id)"
-            if ($m.Missing.Count) { Write-Plain "    Not set : $($m.Missing -join ', ')" }
-            if ($m.Empty.Count)   { Write-Plain "    Empty   : $($m.Empty -join ', ')" }
-            $have = @(); foreach ($t in $TagNames) { if ($m.Missing -notcontains $t -and $m.Empty -notcontains $t) { $have += "$t=$($m.Values[$t])" } }
-            Write-Plain "    Has     : $(if ($have.Count) { $have -join ',  ' } else { '(none of the three tags)' })"
+            Write-Plain "  * $($m.Name)   (report row $($m.Row))"
+            Write-Plain "    ID: $($m.Id)"
+            foreach ($iss in $m.Issues) {
+                Write-Plain ("    - {0,-16} {1,-22} Report='{2}'  Azure='{3}'" -f $iss.Tag, $iss.Issue, $iss.ReportValue, $iss.AzureValue)
+            }
         }
     }
 
-    if ($errorS.Count -gt 0) {
+    if ($errored.Count -gt 0) {
         Write-Plain ""
-        Write-Plain "  COULD NOT BE READ ($($errorS.Count)) - check name/ID, access or tenant:" "Red"
-        foreach ($e in $errorS) {
-            Write-Plain "  * $($e.Name)   (input row $($e.InputRow))  [$($e.Id)]"
+        Write-Plain "  COULD NOT BE VERIFIED ($($errored.Count)) - check access / tenant / sign-in:" "Red"
+        foreach ($e in $errored) {
+            Write-Plain "  * $($e.Name)   (report row $($e.Row))  [$($e.Id)]"
             Write-Plain "    $($e.Error)"
         }
     }
 }
-
 Write-Plain ""
-Write-Plain ("-" * 78)
-if ($saveError) { Write-Plain "  REPORT FILE: NOT SAVED - $saveError" "Red" }
-else {
-    Write-Plain "  Report file : $OutputPath"
-    Write-Plain "  (yellow cells = tag not set or empty; light red rows = subscription could not be read)"
-}
-Write-Plain "  Azure: read-only. Input workbook untouched. No log file written."
+Write-Plain ("=" * 78)
+Write-Plain "  No files were created or modified. Report workbook left untouched."
+Write-Plain "  Azure: read-only."
 Write-Plain ("=" * 78)
