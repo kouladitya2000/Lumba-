@@ -1,46 +1,66 @@
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
+# ============ SETTINGS ============
 $baseUrl = "https://cstmg-fa-euw-01.cstmg-ase-euw-01.appserviceenvironment.net"
-$faCode  = "code=<YOUR_FUNCTION_KEY>"   # paste your key here
 
-# Paste all 52 BA IDs, one per line, in your original order
-$baIds = @"
+#>>> PASTE 1: your function key here (keep the "code=" part)
+$faCode  = "code=<YOUR_FUNCTION_KEY>"
+
+$maxAttempts  = 4     # tries per BA+RITM pair
+$pauseBetween = 500   # ms pause between calls (raise to 1000-2000 if still blocked)
+
+# ============ INPUT LIST ============
+#>>> PASTE 2: paste your whole BA + RITM list between the two markers below,
+#>>> exactly as it appears in Notepad++ (BA line, then its RITMs, NONE lines are fine).
+#>>> The closing "@ MUST stay alone at the very start of its line, no spaces before it.
+$raw = @"
 BA0017001
+NONE
 BA0013517
+RITM32950187,RITM19196554,RITM19859855
 BA0011049
-"@ -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+RITM32945073,RITM27789439
+"@
 
-# Finds "ehcInfo" anywhere in the JSON, whatever the nesting
-function Get-EhcInfo($node) {
-    if ($null -eq $node) { return }
-    if ($node -is [System.Collections.IEnumerable] -and $node -isnot [string]) {
-        foreach ($n in $node) { Get-EhcInfo $n }
-        return
-    }
-    if ($node -is [psobject]) {
-        foreach ($p in $node.PSObject.Properties) {
-            if ($p.Name -eq 'ehcInfo') { $p.Value }
-            else { Get-EhcInfo $p.Value }
-        }
+# ============ BUILD BA -> RITM PAIRS (do not edit) ============
+$entries = @()
+foreach ($line in ($raw -split "\r?\n")) {
+    if ($line -match 'BA\d+') { $entries += @{ BA = $matches[0]; RITMs = @() } }
+    if ($entries.Count -gt 0) {
+        $found = Select-String -InputObject $line -Pattern 'RITM\d+' -AllMatches
+        if ($found) { $entries[-1].RITMs += $found.Matches.Value }
     }
 }
 
-$cache   = @{}
-$results = foreach ($id in $baIds) {
-    if (-not $cache.ContainsKey($id)) {
+# ============ API TEST WITH RETRIES (do not edit) ============
+function Test-Pair($ba, $ritm) {
+    $url = "$baseUrl/api/GetBAData?baid=$ba&ehcId=$ritm&$faCode"
+    for ($i = 1; $i -le $maxAttempts; $i++) {
         try {
-            $url  = "$baseUrl/api/GetBAInfo?baid=$id&$faCode"
-            $resp = Invoke-RestMethod -Uri $url -Method Get -ContentType "application/json"
-            $ids  = @(Get-EhcInfo $resp | ForEach-Object { $_.ehcId }) | Where-Object { $_ }
-            $cache[$id] = if ($ids) { $ids -join "," } else { "NONE" }
+            $resp = Invoke-WebRequest -UseBasicParsing -Uri $url -Method GET -ContentType "application/json"
+            if ($resp.StatusCode -eq 200) { return $true }
         }
-        catch {
-            $cache[$id] = "ERROR: $($_.Exception.Message)"
-        }
+        catch { }
+        if ($i -lt $maxAttempts) { Start-Sleep -Seconds (3 * $i) }   # waits 3s, 6s, 9s
     }
-    [pscustomobject]@{ BAID = $id; EHCIds = $cache[$id] }
+    return $false
 }
 
-$results | Format-Table -AutoSize
-$results | Export-Csv "$env:USERPROFILE\Desktop\BA_EHC.csv" -NoTypeInformation
+# ============ RUN (do not edit) ============
+$cache   = @{}
+$results = foreach ($e in $entries) {
+    $working = @()
+    foreach ($r in $e.RITMs) {
+        $key = "$($e.BA)|$r"
+        if (-not $cache.ContainsKey($key)) {
+            $cache[$key] = Test-Pair $e.BA $r
+            Start-Sleep -Milliseconds $pauseBetween
+            Write-Host "$($e.BA) $r -> $($cache[$key])"
+        }
+        if ($cache[$key]) { $working += $r }
+    }
+    $txt = if ($working.Count -gt 0) { $working -join "," } else { "NONE WORKED" }
+    New-Object PSObject -Property @{ BAID = $e.BA; WorkingEHCs = $txt }
+}
 
+# ============ OUTPUT ============
+$results | Select-Object BAID, WorkingEHCs | Format-Table -AutoSize
+$results | Select-Object BAID, WorkingEHCs | Export-Csv "$env:USERPROFILE\Desktop\BA_WorkingEHC.csv" -NoTypeInformation
