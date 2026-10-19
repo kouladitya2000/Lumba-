@@ -1,50 +1,111 @@
 # ================= Settings (edit these) =================
-$inputCsv  = "$env:USERPROFILE\Downloads\ValidatedBAFINAL.csv"
-$outputCsv = "$env:USERPROFILE\Downloads\SingleFinalEHC_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".csv"
+$inputCsv = "$env:USERPROFILE\Downloads\SingleFinalEHC_20261020_030404.csv"
+$tagName  = "BA ID"
+$tenantId = ""     # optional: your tenant id if you have several tenants
 # =========================================================
 
+if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
+    throw "Az module not found. Run: Install-Module Az.Accounts -Scope CurrentUser"
+}
 if (-not (Test-Path $inputCsv)) { throw "Input file not found: $inputCsv" }
-if (-not (Test-Path (Split-Path $outputCsv))) { throw "Output folder not found: $(Split-Path $outputCsv)" }
+
+if (-not (Get-AzContext)) {
+    if ($tenantId) { Connect-AzAccount -Tenant $tenantId | Out-Null } else { Connect-AzAccount | Out-Null }
+}
 
 $rows = @(Import-Csv $inputCsv -Encoding UTF8)
 if ($rows.Count -eq 0) { throw "Input CSV loaded 0 rows" }
 $cols = $rows[0].PSObject.Properties.Name
-foreach ($need in 'SubscriptionName','SubscriptionId','BA ID','EHC ID') {
+foreach ($need in 'SubscriptionName','SubscriptionId','BA ID') {
     if ($cols -notcontains $need) { throw "Column '$need' not found. Headers: $($cols -join ', ')" }
 }
 
-function Q($v) { '"' + ([string]$v -replace '"', '""') + '"' }
+function Norm($v) { (([string]$v) -replace '\s', '').ToUpper() }
+function NormKey($v) { (([string]$v) -replace '[\s_\-]', '').ToUpper() }
 
-$lines = @()
-$lines += (Q 'SubscriptionName') + "," + (Q 'SubscriptionId') + "," + (Q 'BA ID') + "," + (Q 'EHC ID')
-
-$cntSingle = 0; $cntMulti = 0; $cntKept = 0
-
-foreach ($r in $rows) {
-    $sub    = ([string]$r.'SubscriptionName').Trim()
-    $subId  = ([string]$r.'SubscriptionId').Trim()
-    $baRaw  = ([string]$r.'BA ID').Trim()
-    $ehcRaw = ([string]$r.'EHC ID').Trim()
-
-    # Take the first RITM id (keeps a "(Withdrawn)" label if it has one)
-    if ($ehcRaw -match '^(RITM\d+)(\([^)]*\))?') {
-        $first = $matches[1] + $matches[2]
-        if ($ehcRaw -like '*,*') { $cntMulti++ } else { $cntSingle++ }
+$cache = @{}
+function Get-SubInfo($subId) {
+    if ($cache.ContainsKey($subId)) { return $cache[$subId] }
+    $info = @{ Found = $false; Error = ""; Name = ""; Tags = $null }
+    try {
+        $resp = Invoke-AzRestMethod -Method GET -Path "/subscriptions/$($subId)?api-version=2022-12-01"
+        if ($resp.StatusCode -eq 200) {
+            $j = $resp.Content | ConvertFrom-Json
+            $info.Found = $true
+            $info.Name  = [string]$j.displayName
+            $info.Tags  = $j.tags
+        }
+        else { $info.Error = "HTTP $($resp.StatusCode)" }
     }
-    else {
-        # NO EHC FOUND / NO WORKING EHC / API NOT WORKING etc: keep as-is
-        $first = $ehcRaw
-        $cntKept++
-    }
-
-    $lines += (Q $sub) + "," + (Q $subId) + "," + (Q $baRaw) + "," + (Q $first)
+    catch { $info.Error = $_.Exception.Message }
+    $cache[$subId] = $info
+    return $info
 }
 
-$lines | Out-File -FilePath $outputCsv -Encoding UTF8
+$problems = @()
+$ok = 0; $n = 0; $checked = 0
+
+foreach ($r in $rows) {
+    $n++
+    $sub   = ([string]$r.'SubscriptionName').Trim()
+    $subId = ([string]$r.'SubscriptionId').Trim()
+    $baRaw = ([string]$r.'BA ID').Trim()
+
+    if (-not $sub -and -not $subId -and -not $baRaw) { continue }   # skip blank rows
+    $checked++
+
+    $msg = ""
+
+    if ($subId -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+        $msg = "INVALID SUBSCRIPTION ID IN FILE ($subId)"
+    }
+    else {
+        $info = Get-SubInfo $subId
+        if (-not $info.Found) {
+            $msg = "SUBSCRIPTION NOT FOUND / NO ACCESS ($($info.Error))"
+        }
+        else {
+            $tagFound = $false; $tagVal = ""; $similar = ""
+            if ($info.Tags) {
+                foreach ($p in $info.Tags.PSObject.Properties) {
+                    if ($p.Name -ieq $tagName) { $tagFound = $true; $tagVal = [string]$p.Value }
+                    elseif ((NormKey $p.Name) -eq (NormKey $tagName)) { $similar = $p.Name + "=" + $p.Value }
+                }
+            }
+
+            if (-not $tagFound) {
+                $msg = "TAG DOES NOT EXIST"
+                if ($similar) { $msg += " (similar tag found: $similar)" }
+            }
+            elseif (-not $tagVal.Trim()) {
+                $msg = "TAG EXISTS BUT IS EMPTY"
+            }
+            elseif ((Norm $tagVal) -ne (Norm $baRaw)) {
+                $msg = "MISMATCH - file: $baRaw | Azure tag: $($tagVal.Trim())"
+            }
+        }
+    }
+
+    if ($msg) {
+        $line = "[$n/$($rows.Count)] $sub ($subId) -> $msg"
+        $problems += $line
+        Write-Host $line -ForegroundColor Red
+    }
+    else {
+        $ok++
+        Write-Host "[$n/$($rows.Count)] $sub -> OK ($baRaw)" -ForegroundColor Green
+    }
+}
 
 Write-Host "`n===== SUMMARY =====" -ForegroundColor Cyan
-Write-Host "Rows in input                 : $($rows.Count)"
-Write-Host "Rows reduced to first EHC     : $cntMulti"
-Write-Host "Rows that already had one EHC : $cntSingle"
-Write-Host "Rows kept as-is (no RITM)     : $cntKept"
-Write-Host "Output file                   : $outputCsv"
+Write-Host "Rows checked : $checked"
+Write-Host "Matching     : $ok"
+Write-Host "Problems     : $($problems.Count)"
+
+if ($problems.Count -eq 0) {
+    Write-Host "`n100% READY" -ForegroundColor Green
+}
+else {
+    Write-Host "`nNOT READY - fix these first:" -ForegroundColor Red
+    $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+}
