@@ -3,12 +3,13 @@ $inputCsv  = "C:\Path\report.csv"                       # the validated report s
 $outputCsv = "C:\Path\EHC_Output_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".csv"
 $baseUrl   = "https://cstmg-fa-euw-01.cstmg-ase-euw-01.appserviceenvironment.net"
 $faCode    = "PASTE_YOUR_EXISTING_FACODE_VALUE_HERE"    # same value you already use in your API script
+$processStatuses = @('BAD','MULTI','SKIPPED')           # only rows with these Status values are processed
 
 # ---- Load the report ----
 $rows = @(Import-Csv $inputCsv -Encoding UTF8 -WarningAction SilentlyContinue)
 if ($rows.Count -eq 0) { throw "Input CSV loaded 0 rows - check the path" }
 $cols = $rows[0].PSObject.Properties.Name
-foreach ($need in 'SubscriptionName','SubscriptionId','BA ID') {
+foreach ($need in 'SubscriptionName','SubscriptionId','BA ID','Status') {
     if ($cols -notcontains $need) { throw "Column '$need' not found. Headers seen: $($cols -join ', ')" }
 }
 
@@ -74,23 +75,32 @@ function Get-EhcText($ba) {
     else                        { return "NO EHC FOUND" }
 }
 
-# ---- Process every row (API is called once per unique BA ID) ----
+# ---- Process rows (API is called once per unique BA ID) ----
 $cache = @{}
 $out = @()
+$skipped = @{}
 $n = 0
 
 foreach ($r in $rows) {
     $n++
-    $sub   = ([string]$r.'SubscriptionName').Trim()
-    $subId = ([string]$r.'SubscriptionId').Trim()
-    $baRaw = ([string]$r.'BA ID').Trim()
-    $ba    = $baRaw -replace '\s', ''
+    $sub    = ([string]$r.'SubscriptionName').Trim()
+    $subId  = ([string]$r.'SubscriptionId').Trim()
+    $baRaw  = ([string]$r.'BA ID').Trim()
+    $ba     = $baRaw -replace '\s', ''
+    $status = ([string]$r.'Status').Trim().ToUpper()
 
     if (-not $sub -and -not $subId -and -not $ba) { continue }   # skip blank rows
 
+    # Only BAD / MULTI / SKIPPED rows are processed
+    if ($processStatuses -notcontains $status) {
+        $key = if ($status) { $status } else { "(blank)" }
+        if ($skipped.ContainsKey($key)) { $skipped[$key] = $skipped[$key] + 1 } else { $skipped[$key] = 1 }
+        continue
+    }
+
     if (-not $cache.ContainsKey($ba)) {
         $cache[$ba] = Get-EhcText $ba
-        Write-Host "[$n/$($rows.Count)] $ba -> $($cache[$ba])"
+        Write-Host "[$n/$($rows.Count)] $ba ($status) -> $($cache[$ba])"
     }
 
     $out += [pscustomobject]@{
@@ -101,6 +111,7 @@ foreach ($r in $rows) {
     }
 }
 
+if ($out.Count -eq 0) { throw "No rows with Status in ($($processStatuses -join ', ')) were found - nothing to write" }
 $out | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
 
 # ---- Summary ----
@@ -109,7 +120,9 @@ $none   = @($out | Where-Object { $_.'EHC ID' -eq 'NO EHC FOUND' }).Count
 $wdRows = @($out | Where-Object { $_.'EHC ID' -like '*(Withdrawn)*' }).Count
 
 Write-Host "`n===== SUMMARY =====" -ForegroundColor Cyan
-Write-Host "Rows written        : $($out.Count)"
+Write-Host "Rows in input       : $($rows.Count)"
+Write-Host "Rows processed      : $($out.Count)"
+foreach ($k in $skipped.Keys) { Write-Host "Skipped ($k)".PadRight(20) ": $($skipped[$k])" }
 Write-Host "Unique BA IDs hit   : $($cache.Count)"
 Write-Host "Withdrawn fallback  : $wdRows rows"
 Write-Host "No EHC found        : $none rows"
