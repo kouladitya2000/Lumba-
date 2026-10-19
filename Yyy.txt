@@ -10,7 +10,7 @@ function Norm($v) {
 
 # ---- Load file 1 (correct values): BA -> valid EIMs ----
 $ref = @{}
-foreach ($r in (Import-Csv $file1 -Encoding UTF8)) {
+foreach ($r in (Import-Csv $file1 -Encoding UTF8 -WarningAction SilentlyContinue)) {
     $ba  = Norm $r.'Number'
     $eim = Norm $r.'EIM Application Instance ID'
     if (-not $ref.ContainsKey($ba)) { $ref[$ba] = @{} }
@@ -19,7 +19,7 @@ foreach ($r in (Import-Csv $file1 -Encoding UTF8)) {
 if ($ref.Count -eq 0) { throw "File 1 loaded 0 rows - check path and headers (Number / EIM Application Instance ID)" }
 
 # ---- Load file 2 ----
-$rows = @(Import-Csv $file2 -Encoding UTF8)
+$rows = @(Import-Csv $file2 -Encoding UTF8 -WarningAction SilentlyContinue)
 if ($rows.Count -eq 0) { throw "File 2 loaded 0 rows - check the path" }
 
 $cols = $rows[0].PSObject.Properties.Name
@@ -28,9 +28,9 @@ foreach ($need in 'SubscriptionName','BA ID','EIM') {
 }
 
 Write-Host "File 1 loaded: $($ref.Count) unique BA IDs" -ForegroundColor DarkGray
-Write-Host "File 2 loaded: $($rows.Count) rows" -ForegroundColor DarkGray
+Write-Host "File 2 loaded: $($rows.Count) rows`n" -ForegroundColor DarkGray
 
-# ---- Compare ----
+# ---- Compare and print every row ----
 $failures = @()
 $total = 0
 $rowNum = 1   # header = row 1
@@ -44,36 +44,50 @@ foreach ($r in $rows) {
     if (-not $sub -and -not $ba -and -not $eim) { continue }   # skip blank rows
     $total++
 
+    $reason = ""
+    $expected = ""
     if (-not $ref.ContainsKey($ba)) {
-        $reason = "BA ID not found in file 1"; $expected = ""
+        $reason = "BA ID not found in file 1"
     }
     elseif (-not $ref[$ba].ContainsKey($eim)) {
-        $reason = "EIM mismatch"; $expected = ($ref[$ba].Keys -join ", ")
+        $reason = "EIM mismatch"
+        $expected = ($ref[$ba].Keys -join ", ")
     }
-    else { continue }
 
-    $failures += [pscustomobject]@{
-        CsvRow       = $rowNum
-        Subscription = $sub
-        BA_ID        = $ba
-        EIM_in_File2 = $eim
-        EIM_Expected = $expected
-        Reason       = $reason
+    if ($reason -eq "") {
+        Write-Host "Row $rowNum | $ba | $eim | MATCH" -ForegroundColor Green
+    }
+    else {
+        Write-Host "Row $rowNum | $ba | $eim | FAIL - $reason (expected: $expected)" -ForegroundColor Red
+        $failures += [pscustomobject]@{
+            CsvRow       = $rowNum
+            Subscription = $sub
+            BA_ID        = $ba
+            EIM_in_File2 = $eim
+            EIM_Expected = $expected
+            Reason       = $reason
+        }
     }
 }
 
 # ---- Summary ----
 $bad = $failures.Count
-$pct = [math]::Round((($total - $bad) / $total) * 100, 2)
+$pct = "0.00"
+if ($total -gt 0) { $pct = "{0:N2}" -f ((($total - $bad) / $total) * 100) }
 
 Write-Host "`n===== COMPARISON SUMMARY =====" -ForegroundColor Cyan
 Write-Host "Rows checked : $total"
 Write-Host "Matched      : $($total - $bad)"
 Write-Host "Failed       : $bad"
 
-if ($bad -eq 0) {
+if ($total -eq 0) {
+    Write-Host "Result       : NO ROWS CHECKED - do not trust this" -ForegroundColor Yellow
+}
+elseif ($bad -eq 0) {
     Write-Host "Result       : 100% MATCH" -ForegroundColor Green
-} else {
+}
+else {
     Write-Host "Result       : $pct% match" -ForegroundColor Red
+    Write-Host "`nFailed rows:" -ForegroundColor Red
     $failures | Format-Table -AutoSize
 }
