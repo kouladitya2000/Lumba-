@@ -13,6 +13,9 @@ foreach ($need in 'SubscriptionName','SubscriptionId','BA ID','Status') {
     if ($cols -notcontains $need) { throw "Column '$need' not found. Headers seen: $($cols -join ', ')" }
 }
 
+# Wraps a value in quotes for CSV output
+function Q($v) { '"' + ([string]$v -replace '"', '""') + '"' }
+
 # ---- Finds the ehcInfo list wherever it sits in the JSON ----
 function Find-Ehc($o) {
     if ($null -eq $o) { return $null }
@@ -44,6 +47,8 @@ function Get-EhcText($ba) {
         }
         catch {
             $err = $_.Exception.Message
+            if ($err -like '*404*') { return "BA NOT FOUND (HTTP 404)" }
+            if ($err -like '*401*' -or $err -like '*403*') { throw "Access denied ($err) - check your faCode" }
             Start-Sleep -Seconds 2
         }
     }
@@ -76,10 +81,13 @@ function Get-EhcText($ba) {
 }
 
 # ---- Process rows (API is called once per unique BA ID) ----
-$cache = @{}
-$out = @()
+$cache   = @{}
+$lines   = @()
+$ehcVals = @()
 $skipped = @{}
 $n = 0
+
+$lines += (Q 'SubscriptionName') + "," + (Q 'SubscriptionId') + "," + (Q 'BA ID') + "," + (Q 'EHC ID')
 
 foreach ($r in $rows) {
     $n++
@@ -93,7 +101,8 @@ foreach ($r in $rows) {
 
     # Only BAD / MULTI / SKIPPED rows are processed
     if ($processStatuses -notcontains $status) {
-        $key = if ($status) { $status } else { "(blank)" }
+        $key = "(blank)"
+        if ($status) { $key = $status }
         if ($skipped.ContainsKey($key)) { $skipped[$key] = $skipped[$key] + 1 } else { $skipped[$key] = 1 }
         continue
     }
@@ -103,29 +112,30 @@ foreach ($r in $rows) {
         Write-Host "[$n/$($rows.Count)] $ba ($status) -> $($cache[$ba])"
     }
 
-    $out += [pscustomobject]@{
-        'SubscriptionName' = $sub
-        'SubscriptionId'   = $subId
-        'BA ID'            = $baRaw
-        'EHC ID'           = $cache[$ba]
-    }
+    $ehcVals += $cache[$ba]
+    $lines   += (Q $sub) + "," + (Q $subId) + "," + (Q $baRaw) + "," + (Q $cache[$ba])
 }
 
-if ($out.Count -eq 0) { throw "No rows with Status in ($($processStatuses -join ', ')) were found - nothing to write" }
-$out | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+if ($ehcVals.Count -eq 0) { throw "No rows with Status in ($($processStatuses -join ', ')) were found - nothing to write" }
+$lines | Out-File -FilePath $outputCsv -Encoding UTF8
 
 # ---- Summary ----
-$apiErr = @($out | Where-Object { $_.'EHC ID' -like 'API ERROR*' }).Count
-$none   = @($out | Where-Object { $_.'EHC ID' -eq 'NO EHC FOUND' }).Count
-$wdRows = @($out | Where-Object { $_.'EHC ID' -like '*(Withdrawn)*' }).Count
+$apiErr = 0; $nf404 = 0; $none = 0; $wdRows = 0
+foreach ($v in $ehcVals) {
+    if     ($v -like 'API ERROR*')       { $apiErr++ }
+    elseif ($v -like 'BA NOT FOUND*')    { $nf404++ }
+    elseif ($v -eq 'NO EHC FOUND')       { $none++ }
+    elseif ($v -like '*(Withdrawn)*')    { $wdRows++ }
+}
 
 Write-Host "`n===== SUMMARY =====" -ForegroundColor Cyan
-Write-Host "Rows in input       : $($rows.Count)"
-Write-Host "Rows processed      : $($out.Count)"
-foreach ($k in $skipped.Keys) { Write-Host "Skipped ($k)".PadRight(20) ": $($skipped[$k])" }
-Write-Host "Unique BA IDs hit   : $($cache.Count)"
-Write-Host "Withdrawn fallback  : $wdRows rows"
-Write-Host "No EHC found        : $none rows"
-Write-Host "API errors          : $apiErr rows"
-Write-Host "Output file         : $outputCsv"
-if ($apiErr -gt 0) { Write-Host "Some rows failed - search the output for 'API ERROR' and re-run." -ForegroundColor Red }
+Write-Host "Rows in input        : $($rows.Count)"
+Write-Host "Rows processed       : $($ehcVals.Count)"
+foreach ($k in $skipped.Keys) { Write-Host ("Skipped (" + $k + ")        : " + $skipped[$k]) }
+Write-Host "Unique BA IDs hit    : $($cache.Count)"
+Write-Host "Withdrawn fallback   : $wdRows rows"
+Write-Host "BA not found (404)   : $nf404 rows"
+Write-Host "No EHC found         : $none rows"
+Write-Host "API errors           : $apiErr rows"
+Write-Host "Output file          : $outputCsv"
+if ($apiErr -gt 0) { Write-Host "Some rows hit real API errors - search the output for 'API ERROR' and re-run." -ForegroundColor Red }
