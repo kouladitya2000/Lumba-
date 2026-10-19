@@ -1,7 +1,6 @@
 # ---- Paths (edit these) ----
 $file1 = "C:\Path\baeimcorrect.csv"
 $file2 = "C:\Path\Stage2SubscriptionTagsReportEHCValidateHelper_20261009_160619_ApiValidated.xlsx"
-$sheetName = "Stage2SubscriptionTagsReportEHC"
 
 # Removes spaces, tabs, line breaks, non-breaking and zero-width spaces anywhere in the value
 function Norm($v) {
@@ -17,35 +16,64 @@ foreach ($r in (Import-Csv $file1 -Encoding UTF8)) {
     if (-not $ref.ContainsKey($ba)) { $ref[$ba] = @{} }
     $ref[$ba][$eim] = $true
 }
+if ($ref.Count -eq 0) { throw "File 1 loaded 0 rows - check the path and the headers (Number / EIM Application Instance ID)" }
+Write-Host "File 1 loaded: $($ref.Count) unique BA IDs" -ForegroundColor DarkGray
 
-# ---- Open file 2 via Excel COM (read-only, never saved) ----
-$xl = New-Object -ComObject Excel.Application
-$xl.Visible = $false
-$xl.DisplayAlerts = $false
-$wb = $null
+# ---- Unzip a temp COPY of file 2 (original is never touched) ----
+$tmp = Join-Path $env:TEMP ("xlsxcheck_" + (Get-Random))
+New-Item -ItemType Directory -Path $tmp | Out-Null
 $failures = @()
 $total = 0
 
 try {
-    $wb = $xl.Workbooks.Open($file2, 0, $true)   # UpdateLinks=0, ReadOnly=true
-    $ws = $wb.Worksheets.Item($sheetName)
+    $zip = Join-Path $tmp "copy.zip"
+    $out = Join-Path $tmp "x"
+    Copy-Item -Path $file2 -Destination $zip
+    Expand-Archive -Path $zip -DestinationPath $out -Force
 
-    # Find headers by name so column order doesn't matter
-    $lastCol = $ws.UsedRange.Columns.Count
-    $col = @{}
-    for ($c = 1; $c -le $lastCol; $c++) {
-        $h = ([string]$ws.Cells.Item(1, $c).Text).Trim()
-        if ($h -and -not $col.ContainsKey($h)) { $col[$h] = $c }
+    # Shared strings (text cells point into this list)
+    $shared = @()
+    $ssPath = Join-Path $out "xl\sharedStrings.xml"
+    if (Test-Path $ssPath) {
+        $ss = [xml](Get-Content $ssPath -Raw -Encoding UTF8)
+        foreach ($si in @($ss.sst.si)) { $shared += [string]$si.InnerText }
+    }
+
+    function CellText($c) {
+        if ($c.t -eq 's')           { return [string]$shared[[int]$c.v] }
+        elseif ($c.t -eq 'inlineStr') { return [string]$c.is.InnerText }
+        else                         { return [string]$c.v }
+    }
+
+    # Sheet 1 (your file has a single tab)
+    $sheet   = [xml](Get-Content (Join-Path $out "xl\worksheets\sheet1.xml") -Raw -Encoding UTF8)
+    $rowsXml = @($sheet.worksheet.sheetData.row)
+
+    # Header row: name -> column letter
+    $hdr = @{}
+    foreach ($c in @($rowsXml[0].c)) {
+        if ($null -eq $c) { continue }
+        $letter = $c.r -replace '\d', ''
+        $name = (CellText $c).Trim()
+        if ($name -and -not $hdr.ContainsKey($name)) { $hdr[$name] = $letter }
     }
     foreach ($need in 'SubscriptionName','BA ID','EIM') {
-        if (-not $col.ContainsKey($need)) { throw "Column '$need' not found in header row" }
+        if (-not $hdr.ContainsKey($need)) { throw "Column '$need' not found. Headers found: $($hdr.Keys -join ', ')" }
     }
 
-    $lastRow = $ws.UsedRange.Rows.Count
-    for ($row = 2; $row -le $lastRow; $row++) {
-        $sub = ([string]$ws.Cells.Item($row, $col['SubscriptionName']).Text).Trim()
-        $ba  = Norm $ws.Cells.Item($row, $col['BA ID']).Text
-        $eim = Norm $ws.Cells.Item($row, $col['EIM']).Text
+    foreach ($row in $rowsXml) {
+        $rn = [int]$row.r
+        if ($rn -eq 1) { continue }
+
+        $cells = @{}
+        foreach ($c in @($row.c)) {
+            if ($null -eq $c) { continue }
+            $cells[($c.r -replace '\d', '')] = CellText $c
+        }
+
+        $sub = ([string]$cells[$hdr['SubscriptionName']]).Trim()
+        $ba  = Norm $cells[$hdr['BA ID']]
+        $eim = Norm $cells[$hdr['EIM']]
 
         if (-not $sub -and -not $ba -and -not $eim) { continue }   # skip fully blank rows
         $total++
@@ -59,7 +87,7 @@ try {
         else { continue }
 
         $failures += [pscustomobject]@{
-            ExcelRow     = $row
+            ExcelRow     = $rn
             Subscription = $sub
             BA_ID        = $ba
             EIM_in_File2 = $eim
@@ -69,9 +97,7 @@ try {
     }
 }
 finally {
-    if ($wb) { $wb.Close($false) }
-    $xl.Quit()
-    [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl)
+    Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # ---- Summary ----
@@ -83,9 +109,13 @@ Write-Host "Rows checked : $total"
 Write-Host "Matched      : $($total - $bad)"
 Write-Host "Failed       : $bad"
 
-if ($bad -eq 0) {
+if ($total -eq 0) {
+    Write-Host "Result       : NO ROWS CHECKED - something went wrong, do not trust this" -ForegroundColor Yellow
+}
+elseif ($bad -eq 0) {
     Write-Host "Result       : 100% MATCH" -ForegroundColor Green
-} else {
+}
+else {
     Write-Host "Result       : $pct% match" -ForegroundColor Red
     $failures | Format-Table -AutoSize
 }
