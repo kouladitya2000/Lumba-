@@ -109,3 +109,4 @@ else {
     Write-Host "`nNOT READY - fix these first:" -ForegroundColor Red
     $problems | ForEach-Object { Write-Host $_ -ForegroundColor Red }
 }
+
