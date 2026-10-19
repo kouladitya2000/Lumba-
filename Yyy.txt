@@ -1,145 +1,91 @@
-# ============ SETTINGS ============
-$baseUrl = "https://cstmg-fa-euw-01.cstmg-ase-euw-01.appserviceenvironment.net"
+# ---- Paths (edit these) ----
+$file1 = "C:\Path\baeimcorrect.csv"
+$file2 = "C:\Path\Stage2SubscriptionTagsReportEHCValidateHelper_20261009_160619_ApiValidated.xlsx"
+$sheetName = "Stage2SubscriptionTagsReportEHC"
 
-#>>> PASTE 1: your function key (keep the "code=" part)
-$faCode  = "code=<YOUR_FUNCTION_KEY>"
+# Removes spaces, tabs, line breaks, non-breaking and zero-width spaces anywhere in the value
+function Norm($v) {
+    if ($null -eq $v) { return "" }
+    ([string]$v -replace '[\s\u00A0\u200B\uFEFF]', '').ToUpper()
+}
 
-#>>> PASTE 2: your input CSV (checked against the name in your screenshot)
-$inputCsv  = "$env:USERPROFILE\Desktop\TagsValidator\Stage2SubscriptionTagsReportEHCValidateHelper_20261009_160619_ApiValidated_20261009_200504.csv"
+# ---- Load reference (file 1): BA -> set of valid EIMs ----
+$ref = @{}
+foreach ($r in (Import-Csv $file1 -Encoding UTF8)) {
+    $ba  = Norm $r.'Number'
+    $eim = Norm $r.'EIM Application Instance ID'
+    if (-not $ref.ContainsKey($ba)) { $ref[$ba] = New-Object 'System.Collections.Generic.HashSet[string]' }
+    [void]$ref[$ba].Add($eim)
+}
 
-#>>> PASTE 3: output files (change the names if you like)
-$outputCsv = "$env:USERPROFILE\Desktop\TagsValidator\BA_EHC_API_Report.csv"
-$outputXls = "$env:USERPROFILE\Desktop\TagsValidator\BA_EHC_API_Report.xls"
+# ---- Open file 2 via Excel COM (read-only, never saved) ----
+$xl = New-Object -ComObject Excel.Application
+$xl.Visible = $false
+$xl.DisplayAlerts = $false
+$wb = $null
+$failures = New-Object System.Collections.ArrayList
+$total = 0
 
-$maxAttempts        = 4       # retries for throttling or temporary errors only
-$pauseBetween       = 500     # ms pause between calls (raise to 1000-2000 if blocked)
-$stopAtFirstWorking = $false  # $true = stop at the first working EHC per row (faster)
+try {
+    $wb = $xl.Workbooks.Open($file2, 0, $true)   # UpdateLinks=0, ReadOnly=true
+    $ws = $wb.Worksheets.Item($sheetName)
 
-# Fallback column numbers if the headers aren't found: L = 12 (EHC), M = 13 (BA ID)
-$ehcCol  = 12
-$baCol   = 13
-$keepIdx = 1,2,3,4,5,6,14,15,16     # A-F and N-P
-
-# ============ API TEST (do not edit) ============
-# 404 / "not found" body = real fail (no retry). Other errors (429, 5xx, timeouts) are retried.
-function Test-Pair($ba, $ritm) {
-    $url  = "$baseUrl/api/GetBAData?baid=$ba&ehcId=$ritm&$faCode"
-    $code = 0
-    for ($i = 1; $i -le $maxAttempts; $i++) {
-        try {
-            $resp = Invoke-WebRequest -UseBasicParsing -Uri $url -Method GET -ContentType "application/json"
-            $code = $resp.StatusCode
-            if ($resp.StatusCode -eq 200 -and ([string]$resp.Content) -notmatch 'not found') {
-                return @{ OK = $true; Code = 200 }
-            }
-            return @{ OK = $false; Code = $code }
-        }
-        catch {
-            $code = $_.Exception.Response.StatusCode.value__
-            if ($code -eq 404) { return @{ OK = $false; Code = 404 } }
-        }
-        if ($i -lt $maxAttempts) { Start-Sleep -Seconds (3 * $i) }
+    # Find headers by name so column order doesn't matter
+    $lastCol = $ws.UsedRange.Columns.Count
+    $col = @{}
+    for ($c = 1; $c -le $lastCol; $c++) {
+        $h = ([string]$ws.Cells.Item(1, $c).Text).Trim()
+        if ($h -and -not $col.ContainsKey($h)) { $col[$h] = $c }
     }
-    return @{ OK = $false; Code = $code }
-}
-
-function Enc($s) { "$s" -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' }
-
-# ============ READ INPUT CSV ============
-$genericHeaders = 1..60 | ForEach-Object { "C$_" }
-$all = @(Import-Csv -Path $inputCsv -Header $genericHeaders -Encoding UTF8)
-if ($all.Count -lt 2) {
-    Write-Host "No data rows found. Check the path: $inputCsv" -ForegroundColor Red
-    return
-}
-$hdrRow = $all[0]
-$rows   = @($all | Select-Object -Skip 1)
-
-# find the two input columns by header name
-for ($i = 1; $i -le 60; $i++) {
-    $h = "$($hdrRow."C$i")".Trim()
-    if ($h -eq 'Onboarding EHC')   { $ehcCol = $i }
-    if ($h -eq 'Onboarding BA ID') { $baCol  = $i }
-}
-Write-Host "Rows read: $($rows.Count)   EHC column #$ehcCol   BA ID column #$baCol"
-
-$keepNames = @()
-foreach ($k in $keepIdx) {
-    $n = "$($hdrRow."C$k")".Trim()
-    if (-not $n -or ($keepNames -contains $n)) { $n = "Col$k" }
-    $keepNames += $n
-}
-$cols = $keepNames + @("Onboarding BA ID", "Status Code", "API Works", "Working EHC")
-
-# ============ PROCESS EVERY ROW ============
-$cache  = @{}
-$report = @()
-$rowNum = 1
-
-foreach ($row in $rows) {
-    $rowNum++
-    $ehcText = "$($row."C$ehcCol")"
-    $baText  = "$($row."C$baCol")"
-
-    $ba = ""
-    if ($baText -match 'BA\d+') { $ba = $matches[0] }
-
-    $ritms = @()
-    $found = Select-String -InputObject $ehcText -Pattern 'RITM\d+' -AllMatches
-    if ($found) { $ritms = @($found.Matches.Value) }
-
-    $working = @()
-    $codes   = @()
-    if ($ba -and $ritms.Count -gt 0) {
-        foreach ($ritm in $ritms) {
-            $key = "$ba|$ritm"
-            if (-not $cache.ContainsKey($key)) {
-                $cache[$key] = Test-Pair $ba $ritm
-                Start-Sleep -Milliseconds $pauseBetween
-            }
-            $codes += "$($cache[$key].Code)"
-            if ($cache[$key].OK) {
-                $working += $ritm
-                if ($stopAtFirstWorking) { break }
-            }
-        }
+    foreach ($need in 'SubscriptionName','BA ID','EIM') {
+        if (-not $col.ContainsKey($need)) { throw "Column '$need' not found in header row" }
     }
 
-    if ($working.Count -gt 0)   { $works = "Yes"; $status = "200"; $workTxt = ($working -join ",") }
-    elseif ($codes.Count -gt 0) { $works = "No";  $status = (($codes | Select-Object -Unique) -join ","); $workTxt = "" }
-    else                        { $works = "No";  $status = "N/A"; $workTxt = "" }
+    $lastRow = $ws.UsedRange.Rows.Count
+    for ($row = 2; $row -le $lastRow; $row++) {
+        $sub = ([string]$ws.Cells.Item($row, $col['SubscriptionName']).Text).Trim()
+        $ba  = Norm $ws.Cells.Item($row, $col['BA ID']).Text
+        $eim = Norm $ws.Cells.Item($row, $col['EIM']).Text
 
-    $h = @{}
-    for ($j = 0; $j -lt $keepIdx.Count; $j++) { $h[$keepNames[$j]] = "$($row."C$($keepIdx[$j])")" }
-    $h["Onboarding BA ID"] = $ba
-    $h["Status Code"]      = $status
-    $h["API Works"]        = $works
-    $h["Working EHC"]      = $workTxt
-    $h["Row"]              = $rowNum
-    $report += New-Object PSObject -Property $h
+        if (-not $sub -and -not $ba -and -not $eim) { continue }   # skip fully blank rows
+        $total++
 
-    Write-Host "Row $rowNum  $ba  ->  $works  [$status]  $workTxt"
+        if (-not $ref.ContainsKey($ba)) {
+            $reason = "BA ID not found in file 1"; $expected = ""
+        }
+        elseif (-not $ref[$ba].Contains($eim)) {
+            $reason = "EIM mismatch"; $expected = ($ref[$ba] -join ", ")
+        }
+        else { continue }
+
+        [void]$failures.Add([pscustomobject]@{
+            ExcelRow     = $row
+            Subscription = $sub
+            BA_ID        = $ba
+            EIM_in_File2 = $eim
+            EIM_Expected = $expected
+            Reason       = $reason
+        })
+    }
+}
+finally {
+    if ($wb) { $wb.Close($false) }
+    $xl.Quit()
+    [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl)
 }
 
-# ============ PRINT IN POWERSHELL ============
-$report | Select-Object Row, "Onboarding BA ID", "Status Code", "API Works", "Working EHC" | Format-Table -AutoSize
-$yes = @($report | Where-Object { $_."API Works" -eq "Yes" }).Count
-Write-Host "Works: $yes   Not working: $($report.Count - $yes)   Total rows: $($report.Count)"
+# ---- Summary ----
+$bad = $failures.Count
+$pct = if ($total) { [math]::Round((($total - $bad) / $total) * 100, 2) } else { 0 }
 
-# ============ SAVE CSV ============
-$report | Select-Object $cols | Export-Csv $outputCsv -NoTypeInformation -Encoding UTF8
-Write-Host "Saved CSV: $outputCsv"
+Write-Host "`n===== COMPARISON SUMMARY =====" -ForegroundColor Cyan
+Write-Host "Rows checked : $total"
+Write-Host "Matched      : $($total - $bad)"
+Write-Host "Failed       : $bad"
 
-# ============ SAVE COLORED FILE THAT OPENS IN EXCEL ============
-$lines  = @()
-$lines += '<html><head><meta charset="utf-8"></head><body><table border="1">'
-$lines += '<tr>' + (($cols | ForEach-Object { '<th>' + (Enc $_) + '</th>' }) -join '') + '</tr>'
-foreach ($r in $report) {
-    $bg = '#FFC7CE'
-    if ($r."API Works" -eq "Yes") { $bg = '#C6EFCE' }
-    $cells = ($cols | ForEach-Object { '<td style="mso-number-format:\@">' + (Enc $r.$_) + '</td>' }) -join ''
-    $lines += "<tr style=`"background:$bg`">$cells</tr>"
+if ($bad -eq 0) {
+    Write-Host "Result       : 100% MATCH" -ForegroundColor Green
+} else {
+    Write-Host "Result       : $pct% match" -ForegroundColor Red
+    $failures | Format-Table -AutoSize
 }
-$lines += '</table></body></html>'
-$lines | Out-File -FilePath $outputXls -Encoding UTF8
-Write-Host "Saved colored file: $outputXls"
