@@ -1,93 +1,118 @@
-# ---- Paths (edit these) ----
-$file1 = "C:\Path\baeimcorrect.csv"
-$file2 = "C:\Path\report.csv"
+# ---- Settings (edit these) ----
+$inputCsv  = "C:\Path\report.csv"                       # the validated report saved as CSV
+$outputCsv = "C:\Path\EHC_Output_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".csv"
+$baseUrl   = "https://cstmg-fa-euw-01.cstmg-ase-euw-01.appserviceenvironment.net"
+$faCode    = "PASTE_YOUR_EXISTING_FACODE_VALUE_HERE"    # same value you already use in your API script
 
-# Removes spaces, tabs, line breaks, non-breaking and zero-width spaces anywhere in the value
-function Norm($v) {
-    if ($null -eq $v) { return "" }
-    ([string]$v -replace '[\s\u00A0\u200B\uFEFF]', '').ToUpper()
-}
-
-# ---- Load file 1 (correct values): BA -> valid EIMs ----
-$ref = @{}
-foreach ($r in (Import-Csv $file1 -Encoding UTF8 -WarningAction SilentlyContinue)) {
-    $ba  = Norm $r.'Number'
-    $eim = Norm $r.'EIM Application Instance ID'
-    if (-not $ref.ContainsKey($ba)) { $ref[$ba] = @{} }
-    $ref[$ba][$eim] = $true
-}
-if ($ref.Count -eq 0) { throw "File 1 loaded 0 rows - check path and headers (Number / EIM Application Instance ID)" }
-
-# ---- Load file 2 ----
-$rows = @(Import-Csv $file2 -Encoding UTF8 -WarningAction SilentlyContinue)
-if ($rows.Count -eq 0) { throw "File 2 loaded 0 rows - check the path" }
-
+# ---- Load the report ----
+$rows = @(Import-Csv $inputCsv -Encoding UTF8 -WarningAction SilentlyContinue)
+if ($rows.Count -eq 0) { throw "Input CSV loaded 0 rows - check the path" }
 $cols = $rows[0].PSObject.Properties.Name
-foreach ($need in 'SubscriptionName','BA ID','EIM') {
-    if ($cols -notcontains $need) { throw "Column '$need' not found in file 2. Headers seen: $($cols -join ', ')" }
+foreach ($need in 'SubscriptionName','SubscriptionId','BA ID') {
+    if ($cols -notcontains $need) { throw "Column '$need' not found. Headers seen: $($cols -join ', ')" }
 }
 
-Write-Host "File 1 loaded: $($ref.Count) unique BA IDs" -ForegroundColor DarkGray
-Write-Host "File 2 loaded: $($rows.Count) rows`n" -ForegroundColor DarkGray
-
-# ---- Compare and print every row ----
-$failures = @()
-$total = 0
-$rowNum = 1   # header = row 1
-
-foreach ($r in $rows) {
-    $rowNum++
-    $sub = ([string]$r.'SubscriptionName').Trim()
-    $ba  = Norm $r.'BA ID'
-    $eim = Norm $r.'EIM'
-
-    if (-not $sub -and -not $ba -and -not $eim) { continue }   # skip blank rows
-    $total++
-
-    $reason = ""
-    $expected = ""
-    if (-not $ref.ContainsKey($ba)) {
-        $reason = "BA ID not found in file 1"
+# ---- Finds the ehcInfo list wherever it sits in the JSON ----
+function Find-Ehc($o) {
+    if ($null -eq $o) { return $null }
+    if ($o -is [array]) {
+        foreach ($i in $o) { $r = Find-Ehc $i; if ($null -ne $r) { return $r } }
+        return $null
     }
-    elseif (-not $ref[$ba].ContainsKey($eim)) {
-        $reason = "EIM mismatch"
-        $expected = ($ref[$ba].Keys -join ", ")
-    }
-
-    if ($reason -eq "") {
-        Write-Host "Row $rowNum | $ba | $eim | MATCH" -ForegroundColor Green
-    }
-    else {
-        Write-Host "Row $rowNum | $ba | $eim | FAIL - $reason (expected: $expected)" -ForegroundColor Red
-        $failures += [pscustomobject]@{
-            CsvRow       = $rowNum
-            Subscription = $sub
-            BA_ID        = $ba
-            EIM_in_File2 = $eim
-            EIM_Expected = $expected
-            Reason       = $reason
+    if ($o -is [pscustomobject]) {
+        foreach ($p in $o.PSObject.Properties) {
+            if ($p.Name -eq 'ehcInfo') { return @{ Items = $p.Value } }
+        }
+        foreach ($p in $o.PSObject.Properties) {
+            $r = Find-Ehc $p.Value
+            if ($null -ne $r) { return $r }
         }
     }
+    return $null
 }
+
+# ---- Calls the API for one BA ID and builds the EHC text for column D ----
+function Get-EhcText($ba) {
+    $url = $baseUrl + "/api/GetBAInfo?baid=" + $ba + "&" + $faCode
+    $resp = $null
+    $err = ""
+    for ($try = 1; $try -le 2; $try++) {
+        try {
+            $resp = Invoke-WebRequest -UseBasicParsing -Uri $url -Method GET -ContentType "application/json"
+            break
+        }
+        catch {
+            $err = $_.Exception.Message
+            Start-Sleep -Seconds 2
+        }
+    }
+    if ($null -eq $resp) { return "API ERROR: $err" }
+
+    try { $j = $resp.Content | ConvertFrom-Json }
+    catch { return "API ERROR: response was not valid JSON" }
+
+    $ehc = $j.busappInfo.ehcInfo
+    if (-not $ehc) { $ehc = $j.ehcInfo }
+    if (-not $ehc) {
+        $found = Find-Ehc $j
+        if ($found) { $ehc = $found.Items }
+    }
+    if (-not $ehc) { return "NO EHC FOUND" }
+
+    $mpc = @(); $wd = @(); $other = @()
+    foreach ($e in @($ehc)) {
+        $id = ([string]$e.ehcId).Trim()
+        $st = ([string]$e.ehcStatus).Trim()
+        if     ($st -eq 'Move to Project Control') { $mpc   += $id }
+        elseif ($st -eq 'Withdrawn')               { $wd    += "$id(Withdrawn)" }
+        else                                       { $other += "$id($st)" }
+    }
+
+    if     ($mpc.Count   -gt 0) { return ($mpc -join ", ") }
+    elseif ($wd.Count    -gt 0) { return ($wd -join ", ") }
+    elseif ($other.Count -gt 0) { return ($other -join ", ") }
+    else                        { return "NO EHC FOUND" }
+}
+
+# ---- Process every row (API is called once per unique BA ID) ----
+$cache = @{}
+$out = @()
+$n = 0
+
+foreach ($r in $rows) {
+    $n++
+    $sub   = ([string]$r.'SubscriptionName').Trim()
+    $subId = ([string]$r.'SubscriptionId').Trim()
+    $baRaw = ([string]$r.'BA ID').Trim()
+    $ba    = $baRaw -replace '\s', ''
+
+    if (-not $sub -and -not $subId -and -not $ba) { continue }   # skip blank rows
+
+    if (-not $cache.ContainsKey($ba)) {
+        $cache[$ba] = Get-EhcText $ba
+        Write-Host "[$n/$($rows.Count)] $ba -> $($cache[$ba])"
+    }
+
+    $out += [pscustomobject]@{
+        'SubscriptionName' = $sub
+        'SubscriptionId'   = $subId
+        'BA ID'            = $baRaw
+        'EHC ID'           = $cache[$ba]
+    }
+}
+
+$out | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
 
 # ---- Summary ----
-$bad = $failures.Count
-$pct = "0.00"
-if ($total -gt 0) { $pct = "{0:N2}" -f ((($total - $bad) / $total) * 100) }
+$apiErr = @($out | Where-Object { $_.'EHC ID' -like 'API ERROR*' }).Count
+$none   = @($out | Where-Object { $_.'EHC ID' -eq 'NO EHC FOUND' }).Count
+$wdRows = @($out | Where-Object { $_.'EHC ID' -like '*(Withdrawn)*' }).Count
 
-Write-Host "`n===== COMPARISON SUMMARY =====" -ForegroundColor Cyan
-Write-Host "Rows checked : $total"
-Write-Host "Matched      : $($total - $bad)"
-Write-Host "Failed       : $bad"
-
-if ($total -eq 0) {
-    Write-Host "Result       : NO ROWS CHECKED - do not trust this" -ForegroundColor Yellow
-}
-elseif ($bad -eq 0) {
-    Write-Host "Result       : 100% MATCH" -ForegroundColor Green
-}
-else {
-    Write-Host "Result       : $pct% match" -ForegroundColor Red
-    Write-Host "`nFailed rows:" -ForegroundColor Red
-    $failures | Format-Table -AutoSize
-}
+Write-Host "`n===== SUMMARY =====" -ForegroundColor Cyan
+Write-Host "Rows written        : $($out.Count)"
+Write-Host "Unique BA IDs hit   : $($cache.Count)"
+Write-Host "Withdrawn fallback  : $wdRows rows"
+Write-Host "No EHC found        : $none rows"
+Write-Host "API errors          : $apiErr rows"
+Write-Host "Output file         : $outputCsv"
+if ($apiErr -gt 0) { Write-Host "Some rows failed - search the output for 'API ERROR' and re-run." -ForegroundColor Red }
