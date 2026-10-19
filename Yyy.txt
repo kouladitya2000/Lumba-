@@ -1,6 +1,6 @@
 # ---- Paths (edit these) ----
 $file1 = "C:\Path\baeimcorrect.csv"
-$file2 = "C:\Path\Stage2SubscriptionTagsReportEHCValidateHelper_20261009_160619_ApiValidated.xlsx"
+$file2 = "C:\Path\report.csv"
 
 # Removes spaces, tabs, line breaks, non-breaking and zero-width spaces anywhere in the value
 function Norm($v) {
@@ -8,7 +8,7 @@ function Norm($v) {
     ([string]$v -replace '[\s\u00A0\u200B\uFEFF]', '').ToUpper()
 }
 
-# ---- Load reference (file 1): BA -> hashtable of valid EIMs ----
+# ---- Load file 1 (correct values): BA -> valid EIMs ----
 $ref = @{}
 foreach ($r in (Import-Csv $file1 -Encoding UTF8)) {
     $ba  = Norm $r.'Number'
@@ -16,106 +16,64 @@ foreach ($r in (Import-Csv $file1 -Encoding UTF8)) {
     if (-not $ref.ContainsKey($ba)) { $ref[$ba] = @{} }
     $ref[$ba][$eim] = $true
 }
-if ($ref.Count -eq 0) { throw "File 1 loaded 0 rows - check the path and the headers (Number / EIM Application Instance ID)" }
-Write-Host "File 1 loaded: $($ref.Count) unique BA IDs" -ForegroundColor DarkGray
+if ($ref.Count -eq 0) { throw "File 1 loaded 0 rows - check path and headers (Number / EIM Application Instance ID)" }
 
-# ---- Unzip a temp COPY of file 2 (original is never touched) ----
-$tmp = Join-Path $env:TEMP ("xlsxcheck_" + (Get-Random))
-New-Item -ItemType Directory -Path $tmp | Out-Null
+# ---- Load file 2 ----
+$rows = @(Import-Csv $file2 -Encoding UTF8)
+if ($rows.Count -eq 0) { throw "File 2 loaded 0 rows - check the path" }
+
+$cols = $rows[0].PSObject.Properties.Name
+foreach ($need in 'SubscriptionName','BA ID','EIM') {
+    if ($cols -notcontains $need) { throw "Column '$need' not found in file 2. Headers seen: $($cols -join ', ')" }
+}
+
+Write-Host "File 1 loaded: $($ref.Count) unique BA IDs" -ForegroundColor DarkGray
+Write-Host "File 2 loaded: $($rows.Count) rows" -ForegroundColor DarkGray
+
+# ---- Compare ----
 $failures = @()
 $total = 0
+$rowNum = 1   # header = row 1
 
-try {
-    $zip = Join-Path $tmp "copy.zip"
-    $out = Join-Path $tmp "x"
-    Copy-Item -Path $file2 -Destination $zip
-    Expand-Archive -Path $zip -DestinationPath $out -Force
+foreach ($r in $rows) {
+    $rowNum++
+    $sub = ([string]$r.'SubscriptionName').Trim()
+    $ba  = Norm $r.'BA ID'
+    $eim = Norm $r.'EIM'
 
-    # Shared strings (text cells point into this list)
-    $shared = @()
-    $ssPath = Join-Path $out "xl\sharedStrings.xml"
-    if (Test-Path $ssPath) {
-        $ss = [xml](Get-Content $ssPath -Raw -Encoding UTF8)
-        foreach ($si in @($ss.sst.si)) { $shared += [string]$si.InnerText }
+    if (-not $sub -and -not $ba -and -not $eim) { continue }   # skip blank rows
+    $total++
+
+    if (-not $ref.ContainsKey($ba)) {
+        $reason = "BA ID not found in file 1"; $expected = ""
     }
-
-    function CellText($c) {
-        if ($c.t -eq 's')           { return [string]$shared[[int]$c.v] }
-        elseif ($c.t -eq 'inlineStr') { return [string]$c.is.InnerText }
-        else                         { return [string]$c.v }
+    elseif (-not $ref[$ba].ContainsKey($eim)) {
+        $reason = "EIM mismatch"; $expected = ($ref[$ba].Keys -join ", ")
     }
+    else { continue }
 
-    # Sheet 1 (your file has a single tab)
-    $sheet   = [xml](Get-Content (Join-Path $out "xl\worksheets\sheet1.xml") -Raw -Encoding UTF8)
-    $rowsXml = @($sheet.worksheet.sheetData.row)
-
-    # Header row: name -> column letter
-    $hdr = @{}
-    foreach ($c in @($rowsXml[0].c)) {
-        if ($null -eq $c) { continue }
-        $letter = $c.r -replace '\d', ''
-        $name = (CellText $c).Trim()
-        if ($name -and -not $hdr.ContainsKey($name)) { $hdr[$name] = $letter }
+    $failures += [pscustomobject]@{
+        CsvRow       = $rowNum
+        Subscription = $sub
+        BA_ID        = $ba
+        EIM_in_File2 = $eim
+        EIM_Expected = $expected
+        Reason       = $reason
     }
-    foreach ($need in 'SubscriptionName','BA ID','EIM') {
-        if (-not $hdr.ContainsKey($need)) { throw "Column '$need' not found. Headers found: $($hdr.Keys -join ', ')" }
-    }
-
-    foreach ($row in $rowsXml) {
-        $rn = [int]$row.r
-        if ($rn -eq 1) { continue }
-
-        $cells = @{}
-        foreach ($c in @($row.c)) {
-            if ($null -eq $c) { continue }
-            $cells[($c.r -replace '\d', '')] = CellText $c
-        }
-
-        $sub = ([string]$cells[$hdr['SubscriptionName']]).Trim()
-        $ba  = Norm $cells[$hdr['BA ID']]
-        $eim = Norm $cells[$hdr['EIM']]
-
-        if (-not $sub -and -not $ba -and -not $eim) { continue }   # skip fully blank rows
-        $total++
-
-        if (-not $ref.ContainsKey($ba)) {
-            $reason = "BA ID not found in file 1"; $expected = ""
-        }
-        elseif (-not $ref[$ba].ContainsKey($eim)) {
-            $reason = "EIM mismatch"; $expected = ($ref[$ba].Keys -join ", ")
-        }
-        else { continue }
-
-        $failures += [pscustomobject]@{
-            ExcelRow     = $rn
-            Subscription = $sub
-            BA_ID        = $ba
-            EIM_in_File2 = $eim
-            EIM_Expected = $expected
-            Reason       = $reason
-        }
-    }
-}
-finally {
-    Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # ---- Summary ----
 $bad = $failures.Count
-$pct = if ($total) { [math]::Round((($total - $bad) / $total) * 100, 2) } else { 0 }
+$pct = [math]::Round((($total - $bad) / $total) * 100, 2)
 
 Write-Host "`n===== COMPARISON SUMMARY =====" -ForegroundColor Cyan
 Write-Host "Rows checked : $total"
 Write-Host "Matched      : $($total - $bad)"
 Write-Host "Failed       : $bad"
 
-if ($total -eq 0) {
-    Write-Host "Result       : NO ROWS CHECKED - something went wrong, do not trust this" -ForegroundColor Yellow
-}
-elseif ($bad -eq 0) {
+if ($bad -eq 0) {
     Write-Host "Result       : 100% MATCH" -ForegroundColor Green
-}
-else {
+} else {
     Write-Host "Result       : $pct% match" -ForegroundColor Red
     $failures | Format-Table -AutoSize
 }
