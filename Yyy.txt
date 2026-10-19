@@ -9,13 +9,13 @@ function Norm($v) {
     ([string]$v -replace '[\s\u00A0\u200B\uFEFF]', '').ToUpper()
 }
 
-# ---- Load reference (file 1): BA -> set of valid EIMs ----
+# ---- Load reference (file 1): BA -> hashtable of valid EIMs ----
 $ref = @{}
 foreach ($r in (Import-Csv $file1 -Encoding UTF8)) {
     $ba  = Norm $r.'Number'
     $eim = Norm $r.'EIM Application Instance ID'
-    if (-not $ref.ContainsKey($ba)) { $ref[$ba] = New-Object 'System.Collections.Generic.HashSet[string]' }
-    [void]$ref[$ba].Add($eim)
+    if (-not $ref.ContainsKey($ba)) { $ref[$ba] = @{} }
+    $ref[$ba][$eim] = $true
 }
 
 # ---- Open file 2 via Excel COM (read-only, never saved) ----
@@ -23,7 +23,7 @@ $xl = New-Object -ComObject Excel.Application
 $xl.Visible = $false
 $xl.DisplayAlerts = $false
 $wb = $null
-$failures = New-Object System.Collections.ArrayList
+$failures = @()
 $total = 0
 
 try {
@@ -53,19 +53,19 @@ try {
         if (-not $ref.ContainsKey($ba)) {
             $reason = "BA ID not found in file 1"; $expected = ""
         }
-        elseif (-not $ref[$ba].Contains($eim)) {
-            $reason = "EIM mismatch"; $expected = ($ref[$ba] -join ", ")
+        elseif (-not $ref[$ba].ContainsKey($eim)) {
+            $reason = "EIM mismatch"; $expected = ($ref[$ba].Keys -join ", ")
         }
         else { continue }
 
-        [void]$failures.Add([pscustomobject]@{
+        $failures += [pscustomobject]@{
             ExcelRow     = $row
             Subscription = $sub
             BA_ID        = $ba
             EIM_in_File2 = $eim
             EIM_Expected = $expected
             Reason       = $reason
-        })
+        }
     }
 }
 finally {
