@@ -1,1 +1,46 @@
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$baseUrl = "https://cstmg-fa-euw-01.cstmg-ase-euw-01.appserviceenvironment.net"
+$faCode  = "code=<YOUR_FUNCTION_KEY>"   # paste your key here
+
+# Paste all 52 BA IDs, one per line, in your original order
+$baIds = @"
+BA0017001
+BA0013517
+BA0011049
+"@ -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+
+# Finds "ehcInfo" anywhere in the JSON, whatever the nesting
+function Get-EhcInfo($node) {
+    if ($null -eq $node) { return }
+    if ($node -is [System.Collections.IEnumerable] -and $node -isnot [string]) {
+        foreach ($n in $node) { Get-EhcInfo $n }
+        return
+    }
+    if ($node -is [psobject]) {
+        foreach ($p in $node.PSObject.Properties) {
+            if ($p.Name -eq 'ehcInfo') { $p.Value }
+            else { Get-EhcInfo $p.Value }
+        }
+    }
+}
+
+$cache   = @{}
+$results = foreach ($id in $baIds) {
+    if (-not $cache.ContainsKey($id)) {
+        try {
+            $url  = "$baseUrl/api/GetBAInfo?baid=$id&$faCode"
+            $resp = Invoke-RestMethod -Uri $url -Method Get -ContentType "application/json"
+            $ids  = @(Get-EhcInfo $resp | ForEach-Object { $_.ehcId }) | Where-Object { $_ }
+            $cache[$id] = if ($ids) { $ids -join "," } else { "NONE" }
+        }
+        catch {
+            $cache[$id] = "ERROR: $($_.Exception.Message)"
+        }
+    }
+    [pscustomobject]@{ BAID = $id; EHCIds = $cache[$id] }
+}
+
+$results | Format-Table -AutoSize
+$results | Export-Csv "$env:USERPROFILE\Desktop\BA_EHC.csv" -NoTypeInformation
 
