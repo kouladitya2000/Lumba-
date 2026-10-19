@@ -1,22 +1,10 @@
 # ================= Settings (edit these) =================
-$inputCsv   = "$env:USERPROFILE\Downloads\EHC_Output_20261020_020327.csv"   # file with columns A-D from before
-$outputDir  = "$env:USERPROFILE\Downloads"
-$stamp      = Get-Date -Format "yyyyMMdd_HHmmss"
-$outputCsv  = Join-Path $outputDir "EHC_Validated_$stamp.csv"
-$debugCsv   = Join-Path $outputDir "EHC_Debug_$stamp.csv"
-$baseUrl    = "https://cstmg-fa-euw-01.cstmg-ase-euw-01.appserviceenvironment.net"
-$faCode     = "PASTE_YOUR_FACODE_HERE"      # same value as in your working script, e.g. code=xxxx
-$maxRetries = 5
-$retryDelay = 3                             # seconds x attempt number
-$fakeEhc    = "RITM00000000"                # used for the baseline check
-$requireEhcInBody = $false                  # set $true if a valid response always contains the EHC id
-# Phrases in the response body that mean "this pair is not valid" (regex, case-insensitive)
-$failPattern = 'not found|invalid|does not exist|no record|not associated|not linked|mismatch|not valid|no data|no matching|unable to find'
+$inputCsv  = "$env:USERPROFILE\Downloads\ValidatedBAFINAL.csv"
+$outputCsv = "$env:USERPROFILE\Downloads\SingleFinalEHC_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".csv"
 # =========================================================
 
-if (-not (Test-Path $inputCsv))  { throw "Input file not found: $inputCsv" }
-if (-not (Test-Path $outputDir)) { throw "Output folder not found: $outputDir" }
-if ($faCode -like 'PASTE*')      { throw "Set `$faCode first" }
+if (-not (Test-Path $inputCsv)) { throw "Input file not found: $inputCsv" }
+if (-not (Test-Path (Split-Path $outputCsv))) { throw "Output folder not found: $(Split-Path $outputCsv)" }
 
 $rows = @(Import-Csv $inputCsv -Encoding UTF8)
 if ($rows.Count -eq 0) { throw "Input CSV loaded 0 rows" }
@@ -27,192 +15,36 @@ foreach ($need in 'SubscriptionName','SubscriptionId','BA ID','EHC ID') {
 
 function Q($v) { '"' + ([string]$v -replace '"', '""') + '"' }
 
-function Short($s, $n) {
-    $s = ([string]$s) -replace '\s+', ' '
-    if ($s.Length -gt $n) { return $s.Substring(0, $n) + "..." }
-    return $s
-}
-
-# ---- Calls the API with retries. Kind = HTTP200 | REJECTED | API_DOWN ----
-function Invoke-Api($ba, $ehc) {
-    $url = $baseUrl + "/api/GetBAData?baid=" + $ba + "&ehcId=" + $ehc + "&" + $faCode
-    $lastErr = ""; $kind = "API_DOWN"
-    for ($try = 1; $try -le $maxRetries; $try++) {
-        try {
-            $resp = Invoke-WebRequest -UseBasicParsing -Uri $url -Method GET -ContentType "application/json"
-            if ($resp.StatusCode -eq 200) {
-                return @{ Kind = 'HTTP200'; Body = [string]$resp.Content; Error = '' }
-            }
-            $lastErr = "HTTP $($resp.StatusCode)"; $kind = "API_DOWN"
-        }
-        catch {
-            $code = 0
-            if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
-            if ($code -gt 0) {
-                $lastErr = "HTTP $code"
-                if ($code -in 401,403,408,429 -or $code -ge 500) { $kind = "API_DOWN" } else { $kind = "REJECTED" }
-            } else {
-                $lastErr = "No response (" + (Short $_.Exception.Message 80) + ")"
-                $kind = "API_DOWN"
-            }
-        }
-        if ($try -lt $maxRetries) { Start-Sleep -Seconds ($retryDelay * $try) }
-    }
-    return @{ Kind = $kind; Body = ''; Error = "$lastErr after $maxRetries tries" }
-}
-
-# ---- Decides from the response body whether the pair is valid. Returns "" if OK, else the reason ----
-$script:baselineBody = $null
-
-function Judge-Body($body, $ehc) {
-    $c = ([string]$body).Trim()
-
-    if (-not $c -or $c -in 'null','[]','{}','""') { return "Empty response body" }
-
-    if ($script:baselineBody -and $c -eq $script:baselineBody) { return "Same response as fake EHC" }
-
-    # JSON field checks
-    $j = $null
-    try { $j = $c | ConvertFrom-Json -ErrorAction Stop } catch { }
-    if ($j -is [pscustomobject]) {
-        foreach ($p in $j.PSObject.Properties) {
-            $name = $p.Name.ToLower(); $val = $p.Value
-            if ($name -in 'success','issuccess','valid','isvalid','found','isfound','exists','status') {
-                if ($val -is [bool] -and $val -eq $false) { return "Field '$($p.Name)' = false" }
-                if ($val -is [string] -and $val -match '^(false|fail|failed|error|invalid|notfound|not found)$') { return "Field '$($p.Name)' = $val" }
-            }
-            if ($name -in 'error','errors','errormessage','message','detail','title') {
-                $t = [string]$val
-                if ($t -and $t -match $failPattern) { return "Field '$($p.Name)': " + (Short $t 80) }
-            }
-        }
-    }
-
-    # Raw text check (ignore harmless "error": null style fields)
-    $clean = $c -replace '"[A-Za-z]*error[A-Za-z]*"\s*:\s*(null|""|\[\])', ''
-    if ($clean -match $failPattern) { return "Body contains: " + $matches[0] }
-
-    if ($requireEhcInBody -and ($c -notmatch [regex]::Escape($ehc))) { return "EHC id not present in response" }
-
-    return ""
-}
-
-# ---- Tests one pair. Status = OK | REJECTED | API_DOWN ----
-function Test-Pair($ba, $ehc) {
-    $a = Invoke-Api $ba $ehc
-    if ($a.Kind -eq 'HTTP200') {
-        $reason = Judge-Body $a.Body $ehc
-        if ($reason) { return @{ Status = 'REJECTED'; Error = $reason; Snippet = (Short $a.Body 250) } }
-        return @{ Status = 'OK'; Error = ''; Snippet = (Short $a.Body 250) }
-    }
-    return @{ Status = $a.Kind; Error = $a.Error; Snippet = '' }
-}
-
-# ---- Baseline: what does the API return for a fake EHC? ----
-$firstBa = ""
-foreach ($r in $rows) {
-    $b = (([string]$r.'BA ID').Trim() -replace '\s', '')
-    $e = ([string]$r.'EHC ID').Trim()
-    if ($b -and $e -and $e -notlike 'NO EHC*' -and $e -notlike 'BA NOT*' -and $e -notlike 'API ERROR*') { $firstBa = $b; break }
-}
-if ($firstBa) {
-    Write-Host "Baseline check with fake EHC $fakeEhc on $firstBa ..." -ForegroundColor Yellow
-    $base = Invoke-Api $firstBa $fakeEhc
-    if ($base.Kind -eq 'HTTP200') {
-        $script:baselineBody = ([string]$base.Body).Trim()
-        Write-Host "  Fake EHC returned HTTP 200. Body: $(Short $script:baselineBody 200)" -ForegroundColor Yellow
-    } else {
-        Write-Host "  Fake EHC returned: $($base.Kind) - $($base.Error) (good, the API rejects bad pairs by status)" -ForegroundColor Yellow
-    }
-}
-
-# ---- Process rows in original order ----
-$cache = @{}
 $lines = @()
 $lines += (Q 'SubscriptionName') + "," + (Q 'SubscriptionId') + "," + (Q 'BA ID') + "," + (Q 'EHC ID')
-$dbg = @()
-$dbg += (Q 'BA') + "," + (Q 'EHC') + "," + (Q 'Verdict') + "," + (Q 'Reason') + "," + (Q 'ResponseSnippet')
-$n = 0
-$cntWorking = 0; $cntNone = 0; $cntRejected = 0; $cntApiDown = 0; $cntPartial = 0
+
+$cntSingle = 0; $cntMulti = 0; $cntKept = 0
 
 foreach ($r in $rows) {
-    $n++
     $sub    = ([string]$r.'SubscriptionName').Trim()
     $subId  = ([string]$r.'SubscriptionId').Trim()
     $baRaw  = ([string]$r.'BA ID').Trim()
-    $ba     = $baRaw -replace '\s', ''
     $ehcRaw = ([string]$r.'EHC ID').Trim()
 
-    if (-not $ehcRaw -or $ehcRaw -like 'NO EHC FOUND*' -or $ehcRaw -like 'BA NOT FOUND*' -or $ehcRaw -like 'API ERROR*') {
-        $out = $ehcRaw
-        if (-not $out) { $out = "NO EHC FOUND" }
-        $cntNone++
-        $lines += (Q $sub) + "," + (Q $subId) + "," + (Q $baRaw) + "," + (Q $out)
-        Write-Host "[$n/$($rows.Count)] $ba -> $out (no API call)"
-        continue
-    }
-
-    $working = @(); $rejected = @(); $apiDown = @()
-    foreach ($token in ($ehcRaw -split ',')) {
-        $token = $token.Trim()
-        if (-not $token) { continue }
-        $id = $token; $label = ""
-        if ($token -match '^([^(]+)(\(.*\))$') { $id = $matches[1].Trim(); $label = $matches[2] }
-
-        $key = "$ba|$id"
-        if (-not $cache.ContainsKey($key)) {
-            $cache[$key] = Test-Pair $ba $id
-            $dbg += (Q $ba) + "," + (Q $id) + "," + (Q $cache[$key].Status) + "," + (Q $cache[$key].Error) + "," + (Q $cache[$key].Snippet)
-        }
-        $res = $cache[$key]
-
-        switch ($res.Status) {
-            'OK'       { $working  += ($id + $label) }
-            'REJECTED' { $rejected += ($id + ": " + $res.Error) }
-            default    { $apiDown  += ($id + ": " + $res.Error) }
-        }
-    }
-
-    if ($working.Count -gt 0) {
-        $out = $working -join ", "
-        $cntWorking++
-        if ($apiDown.Count -gt 0) {
-            $out += " [UNVERIFIED - API issue: " + ($apiDown -join " | ") + "]"
-            $cntPartial++
-        }
-    }
-    elseif ($apiDown.Count -gt 0 -and $rejected.Count -eq 0) {
-        $out = "API NOT WORKING - " + ($apiDown -join " | ")
-        $cntApiDown++
+    # Take the first RITM id (keeps a "(Withdrawn)" label if it has one)
+    if ($ehcRaw -match '^(RITM\d+)(\([^)]*\))?') {
+        $first = $matches[1] + $matches[2]
+        if ($ehcRaw -like '*,*') { $cntMulti++ } else { $cntSingle++ }
     }
     else {
-        $parts = @()
-        if ($rejected.Count -gt 0) { $parts += $rejected }
-        if ($apiDown.Count  -gt 0) { $parts += ($apiDown | ForEach-Object { $_ + " (API issue)" }) }
-        $out = "NO WORKING EHC - " + ($parts -join " | ")
-        $cntRejected++
+        # NO EHC FOUND / NO WORKING EHC / API NOT WORKING etc: keep as-is
+        $first = $ehcRaw
+        $cntKept++
     }
 
-    $lines += (Q $sub) + "," + (Q $subId) + "," + (Q $baRaw) + "," + (Q $out)
-    Write-Host "[$n/$($rows.Count)] $ba -> $out"
+    $lines += (Q $sub) + "," + (Q $subId) + "," + (Q $baRaw) + "," + (Q $first)
 }
 
 $lines | Out-File -FilePath $outputCsv -Encoding UTF8
-$dbg   | Out-File -FilePath $debugCsv  -Encoding UTF8
-
-$okPairs  = @($cache.Values | Where-Object { $_.Status -eq 'OK' }).Count
-$badPairs = @($cache.Values | Where-Object { $_.Status -eq 'REJECTED' }).Count
-$dnPairs  = @($cache.Values | Where-Object { $_.Status -eq 'API_DOWN' }).Count
 
 Write-Host "`n===== SUMMARY =====" -ForegroundColor Cyan
-Write-Host "Rows in input            : $($rows.Count)"
-Write-Host "Rows with working EHC    : $cntWorking  (partly unverified: $cntPartial)"
-Write-Host "Rows, EHC rejected       : $cntRejected"
-Write-Host "Rows, API NOT WORKING    : $cntApiDown"
-Write-Host "NO EHC FOUND rows        : $cntNone"
-Write-Host "Unique pairs tested      : $($cache.Count)  (OK: $okPairs, rejected: $badPairs, API down: $dnPairs)"
-Write-Host "Output file              : $outputCsv"
-Write-Host "Debug file               : $debugCsv"
-if ($badPairs -eq 0 -and $dnPairs -eq 0) {
-    Write-Host "WARNING: nothing was rejected. Open the debug file, compare a good and a bad pair's ResponseSnippet, and tell me what differs (or set `$requireEhcInBody = `$true)." -ForegroundColor Red
-}
+Write-Host "Rows in input                 : $($rows.Count)"
+Write-Host "Rows reduced to first EHC     : $cntMulti"
+Write-Host "Rows that already had one EHC : $cntSingle"
+Write-Host "Rows kept as-is (no RITM)     : $cntKept"
+Write-Host "Output file                   : $outputCsv"
