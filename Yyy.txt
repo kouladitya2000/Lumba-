@@ -1,11 +1,45 @@
-# ---------- CONFIG ----------
+# ================= CONFIG =================
 $csvPath      = "C:\Users\45270978\Desktop\TagsValidator\SingleFinalEHC_20261020_030404.csv"  # read-only
 $baseUrl      = "https://cstmg-fa-euw-01.cstmg-ase-euw-01.appserviceenvironment.net"
 $faCode       = "PASTE_YOUR_FACODE_HERE"   # same value as your working script
 $maxRetries   = 4
-$baseDelay    = 3      # seconds, doubles each retry (3, 6, 12)
-$pauseBetween = 1
-# ----------------------------
+$baseDelay    = 5     # seconds before first retry, doubles each time (5, 10, 20)
+$pauseBetween = 3     # seconds between records (gentle on the API)
+$stopAfterConsecutiveFails = 5   # auto-stop if this many EHC records fail in a row (0 = never)
+# ==========================================
+
+# ---------- Ask for start / end row ----------
+Write-Host "Enter Excel row numbers (header = row 1, first record = row 2)" -ForegroundColor Cyan
+$inStart = Read-Host "Start from Excel row (press Enter for 2)"
+$inEnd   = Read-Host "Stop at Excel row (press Enter for last row)"
+
+$rows  = @(Import-Csv -Path $csvPath)
+$total = $rows.Count
+$lastExcel = $total + 1
+
+$startExcel = 2
+if ($inStart -match '^\d+$') { $startExcel = [int]$inStart }
+if ($startExcel -lt 2) { $startExcel = 2 }
+
+$endExcel = $lastExcel
+if ($inEnd -match '^\d+$' -and [int]$inEnd -ge $startExcel -and [int]$inEnd -lt $lastExcel) { $endExcel = [int]$inEnd }
+
+if ($startExcel -gt $lastExcel) {
+    Write-Host "Start row $startExcel is beyond the last row ($lastExcel). Nothing to do." -ForegroundColor Red
+    return
+}
+
+$processed = $endExcel - $startExcel + 1
+$results   = @()
+$startTime = Get-Date
+$lastDone  = 0
+$consecFails = 0
+$stoppedEarly = $false
+
+Write-Host "`n############################################################" -ForegroundColor Cyan
+Write-Host "RUN STARTED: Excel rows $startExcel to $endExcel ($processed records)" -ForegroundColor Cyan
+Write-Host "File has $total records (Excel rows 2 to $lastExcel)" -ForegroundColor Cyan
+Write-Host "############################################################`n" -ForegroundColor Cyan
 
 function ShowRows($list, $fields) {
     foreach ($r in $list) {
@@ -15,148 +49,186 @@ function ShowRows($list, $fields) {
     }
 }
 
-$rows    = Import-Csv -Path $csvPath
-$total   = @($rows).Count
-$results = @()
-$i = 0
-$startTime = Get-Date
+function Show-Summary {
+    $elapsed   = (Get-Date) - $startTime
+    $passed    = @($results | Where-Object { $_.Category -eq "PASSED" }        | Sort-Object { $_.ExcelRow })
+    $passedNo  = @($results | Where-Object { $_.Category -eq "PASSED_NO_EHC" } | Sort-Object { $_.ExcelRow })
+    $empty     = @($results | Where-Object { $_.Category -eq "EMPTY_RESPONSE" } | Sort-Object { $_.ExcelRow })
+    $failed    = @($results | Where-Object { $_.Category -eq "FAILED" }        | Sort-Object { $_.ExcelRow })
+    $noEhcAll  = @($results | Where-Object { $_.NoEHC }       | Sort-Object { $_.ExcelRow })
+    $withdrawn = @($results | Where-Object { $_.Withdrawn }   | Sort-Object { $_.ExcelRow })
+    $retried   = @($results | Where-Object { $_.Attempts -gt 1 -and $_.Category -ne "FAILED" } | Sort-Object { $_.ExcelRow })
+    $mismatch  = @($results | Where-Object { $_.Category -like "PASSED*" -and $_.SentEHC -and $_.RespEHC -and $_.SentEHC -ne $_.RespEHC } | Sort-Object { $_.ExcelRow })
+    $failedWithEhc = @($failed | Where-Object { -not $_.NoEHC })
 
-Write-Host "Loaded $total records from $csvPath" -ForegroundColor Cyan
+    Write-Host "`n==================== FINAL SUMMARY ====================" -ForegroundColor Cyan
+    if ($results.Count -gt 0) {
+        Write-Host "Excel rows covered           : $($results[0].ExcelRow) to $lastDone"
+    }
+    Write-Host "Run time                     : $([int]$elapsed.TotalMinutes) min"
+    Write-Host "Records processed            : $($results.Count) of $processed planned"
+    Write-Host "PASSED (with EHC)            : $($passed.Count)"   -ForegroundColor Green
+    Write-Host "PASSED (no EHC, tried anyway): $($passedNo.Count)" -ForegroundColor Green
+    Write-Host "EMPTY response (HTTP OK)     : $($empty.Count)"    -ForegroundColor Magenta
+    Write-Host "FAILED (after all retries)   : $($failed.Count)"   -ForegroundColor Red
+    Write-Host "   of which had a valid EHC  : $($failedWithEhc.Count)" -ForegroundColor Red
+    Write-Host "Had no EHC in input          : $($noEhcAll.Count)" -ForegroundColor Yellow
+    Write-Host "(Withdrawn) cleaned          : $($withdrawn.Count)"
+    Write-Host "Succeeded only after retry   : $($retried.Count)"
 
-foreach ($row in $rows) {
-    $i++
-    $baId   = ("" + $row.'BA ID').Trim()
-    $rawEhc = ("" + $row.'EHC ID').Trim()
-    $ehcId  = ($rawEhc -replace '\(.*?\)', '').Trim()
-    $cleaned = ($ehcId -ne $rawEhc)
-
-    $noEhc = $false
-    if ($ehcId -eq "" -or $ehcId -match 'NO EHC FOUND' -or $ehcId -match '^API ERROR') {
-        $noEhc = $true
-        $ehcId = ""
-        Write-Host "[$i/$total] WARN   BA=$baId has no EHC ('$rawEhc') - trying with empty ehcId" -ForegroundColor Yellow
+    Write-Host "`n---------- FAILED RECORDS ----------" -ForegroundColor Red
+    if ($failed.Count -eq 0) { Write-Host "None" -ForegroundColor Green }
+    else {
+        foreach ($f in $failed) {
+            Write-Host "Excel row $($f.ExcelRow) | BA=$($f.BAID) | SentEHC=$($f.SentEHC) | Original='$($f.OriginalEHC)'" -ForegroundColor Red
+            Write-Host "   HTTP   : $($f.HttpStatus)   Attempts: $($f.Attempts)"
+            Write-Host "   Error  : $($f.Error)"
+            Write-Host "   Body   : $($f.ErrorBody)"
+            Write-Host "   History: $($f.RetryHistory)"
+        }
+        Write-Host "`nFailures grouped by HTTP status:" -ForegroundColor Red
+        $failed | Group-Object { $_.HttpStatus } | ForEach-Object { Write-Host "   HTTP $($_.Name) : $($_.Count)" }
+        $rowList = @()
+        foreach ($f in $failedWithEhc) { $rowList += $f.ExcelRow }
+        if ($rowList.Count -gt 0) {
+            Write-Host "`nExcel rows to re-run (failed WITH a valid EHC): $($rowList -join ', ')" -ForegroundColor Red
+        }
     }
 
-    $url = "$baseUrl/api/GetBAData?baid=$baId&ehcId=$ehcId&$faCode"
+    Write-Host "`n---------- EMPTY RESPONSES (HTTP success, no data) ----------" -ForegroundColor Magenta
+    if ($empty.Count -eq 0) { Write-Host "None" -ForegroundColor Green }
+    else { ShowRows $empty @('ExcelRow','BAID','SentEHC','OriginalEHC','HttpStatus') }
 
-    $success = $false; $httpStatus = ""; $content = $null
-    $errMsg = ""; $errBody = ""; $attemptsUsed = 0; $retryErrors = @()
-    $wait = $baseDelay
+    Write-Host "`n---------- RECORDS WITH NO EHC (outcome of trying anyway) ----------" -ForegroundColor Yellow
+    if ($noEhcAll.Count -eq 0) { Write-Host "None" }
+    else { ShowRows $noEhcAll @('ExcelRow','BAID','OriginalEHC','Category','HttpStatus','Error') }
 
-    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
-        $attemptsUsed = $attempt
-        try {
-            $resp = Invoke-WebRequest -UseBasicParsing -Uri $url -Method GET -ContentType "application/json" -TimeoutSec 60
-            $content = $resp.Content
-            $httpStatus = [int]$resp.StatusCode
-            $success = $true
-            break
+    Write-Host "`n---------- (Withdrawn) CLEANED ----------" -ForegroundColor Yellow
+    if ($withdrawn.Count -eq 0) { Write-Host "None" }
+    else { ShowRows $withdrawn @('ExcelRow','BAID','OriginalEHC','SentEHC','Category','HttpStatus') }
+
+    Write-Host "`n---------- SUCCEEDED AFTER RETRY ----------" -ForegroundColor DarkYellow
+    if ($retried.Count -eq 0) { Write-Host "None" }
+    else { ShowRows $retried @('ExcelRow','BAID','SentEHC','Attempts','RetryHistory') }
+
+    Write-Host "`n---------- SENT EHC != EHC RETURNED BY API ----------" -ForegroundColor Yellow
+    if ($mismatch.Count -eq 0) { Write-Host "None" }
+    else { ShowRows $mismatch @('ExcelRow','BAID','SentEHC','RespEHC','RespEHCStatus') }
+
+    Write-Host "`n############################################################" -ForegroundColor Cyan
+    if ($lastDone -gt 0) {
+        Write-Host "LAST EXCEL ROW PROCESSED: $lastDone" -ForegroundColor Cyan
+        if ($lastDone -lt $lastExcel) {
+            Write-Host "NEXT RUN: start from Excel row $($lastDone + 1)" -ForegroundColor Cyan
+        } else {
+            Write-Host "End of file reached." -ForegroundColor Cyan
         }
-        catch {
-            $code = ""
-            if ($_.Exception.Response) { try { $code = [int]$_.Exception.Response.StatusCode } catch {} }
-            $httpStatus = $code
-            $errMsg  = $_.Exception.Message
-            $errBody = ""
-            if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errBody = $_.ErrorDetails.Message }
-            $retryErrors += "attempt $attempt : HTTP $code - $errMsg"
+    }
+    Write-Host "############################################################" -ForegroundColor Cyan
+    Write-Host "Full data is in memory in `$results (nothing written to disk)." -ForegroundColor DarkGray
+}
 
-            if ($attempt -lt $maxRetries) {
-                Write-Host "[$i/$total] RETRY  $attempt/$maxRetries BA=$baId EHC=$ehcId -> HTTP $code $errMsg. Waiting ${wait}s" -ForegroundColor DarkYellow
-                Start-Sleep -Seconds $wait
-                $wait = $wait * 2
+# ================= MAIN LOOP =================
+try {
+    for ($excelRow = $startExcel; $excelRow -le $endExcel; $excelRow++) {
+        $row  = $rows[$excelRow - 2]
+        $pos  = $excelRow - $startExcel + 1
+        $tag  = "[Excel row $excelRow | $pos/$processed]"
+
+        $baId   = ("" + $row.'BA ID').Trim()
+        $rawEhc = ("" + $row.'EHC ID').Trim()
+        $ehcId  = ($rawEhc -replace '\(.*?\)', '').Trim()
+        $cleaned = ($ehcId -ne $rawEhc)
+
+        $noEhc = $false
+        if ($ehcId -eq "" -or $ehcId -match 'NO EHC FOUND' -or $ehcId -match '^API ERROR') {
+            $noEhc = $true
+            $ehcId = ""
+            Write-Host "$tag WARN   BA=$baId has no EHC ('$rawEhc') - trying with empty ehcId" -ForegroundColor Yellow
+        }
+        if ($cleaned) {
+            Write-Host "$tag INFO   cleaned '$rawEhc' -> '$ehcId'" -ForegroundColor DarkGray
+        }
+
+        $url = "$baseUrl/api/GetBAData?baid=$baId&ehcId=$ehcId&$faCode"
+
+        $success = $false; $httpStatus = ""; $content = $null
+        $errMsg = ""; $errBody = ""; $attemptsUsed = 0; $retryErrors = @()
+        $wait = $baseDelay
+
+        for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+            $attemptsUsed = $attempt
+            try {
+                $resp = Invoke-WebRequest -UseBasicParsing -Uri $url -Method GET -ContentType "application/json" -TimeoutSec 60
+                $content = $resp.Content
+                $httpStatus = [int]$resp.StatusCode
+                $success = $true
+                break
+            }
+            catch {
+                $code = ""
+                if ($_.Exception.Response) { try { $code = [int]$_.Exception.Response.StatusCode } catch {} }
+                $httpStatus = $code
+                $errMsg  = $_.Exception.Message
+                $errBody = ""
+                if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errBody = $_.ErrorDetails.Message }
+                $retryErrors += "attempt $attempt : HTTP $code - $errMsg"
+
+                if ($attempt -lt $maxRetries) {
+                    Write-Host "$tag RETRY  $attempt/$maxRetries BA=$baId EHC=$ehcId -> HTTP $code $errMsg Waiting ${wait}s" -ForegroundColor DarkYellow
+                    Start-Sleep -Seconds $wait
+                    $wait = $wait * 2
+                }
             }
         }
+
+        $isEmpty = $false; $json = $null
+        if ($success) {
+            if ($content -eq $null -or $content.Trim() -eq "" -or $content.Trim() -match '^(\[\]|\{\}|null)$') { $isEmpty = $true }
+            else { try { $json = $content | ConvertFrom-Json } catch {} }
+        }
+
+        if     (-not $success) { $category = "FAILED" }
+        elseif ($isEmpty)      { $category = "EMPTY_RESPONSE" }
+        elseif ($noEhc)        { $category = "PASSED_NO_EHC" }
+        else                   { $category = "PASSED" }
+
+        switch ($category) {
+            "PASSED"         { Write-Host "$tag OK     BA=$baId EHC=$ehcId -> HTTP $httpStatus (attempts: $attemptsUsed)" -ForegroundColor Green }
+            "PASSED_NO_EHC"  { Write-Host "$tag OK*    BA=$baId (no EHC) -> HTTP $httpStatus (attempts: $attemptsUsed)" -ForegroundColor Green }
+            "EMPTY_RESPONSE" { Write-Host "$tag EMPTY  BA=$baId EHC=$ehcId -> HTTP $httpStatus but body is empty" -ForegroundColor Magenta }
+            "FAILED"         { Write-Host "$tag FAILED BA=$baId EHC=$ehcId ('$rawEhc') -> HTTP $httpStatus | $errMsg | after $attemptsUsed attempts" -ForegroundColor Red }
+        }
+
+        $respEhc = ""; $respStatus = ""
+        if ($json) { $respEhc = $json.ehcId; $respStatus = $json.ehcStatus }
+
+        $results += @{
+            ExcelRow = $excelRow; BAID = $baId; SentEHC = $ehcId; OriginalEHC = $rawEhc
+            Withdrawn = $cleaned; NoEHC = $noEhc; Category = $category
+            HttpStatus = $httpStatus; Attempts = $attemptsUsed
+            RespEHC = $respEhc; RespEHCStatus = $respStatus
+            Error = $errMsg; ErrorBody = $errBody
+            RetryHistory = ($retryErrors -join " | ")
+            Response = $content
+        }
+        $lastDone = $excelRow
+
+        # Auto-stop if API looks like it is throttling (only counts records that HAD an EHC)
+        if ($category -eq "FAILED" -and -not $noEhc) { $consecFails++ }
+        elseif ($category -ne "FAILED") { $consecFails = 0 }
+
+        if ($stopAfterConsecutiveFails -gt 0 -and $consecFails -ge $stopAfterConsecutiveFails) {
+            Write-Host "`n!!! $consecFails consecutive failures with valid EHC. Stopping so you can wait and resume." -ForegroundColor Red
+            Write-Host "!!! Resume from Excel row $($excelRow - $consecFails + 1) (first of the failing streak)" -ForegroundColor Red
+            $stoppedEarly = $true
+            break
+        }
+
+        Start-Sleep -Seconds $pauseBetween
     }
-
-    $isEmpty = $false; $json = $null
-    if ($success) {
-        if ([string]::IsNullOrWhiteSpace($content) -or $content.Trim() -match '^(\[\]|\{\}|null)$') { $isEmpty = $true }
-        else { try { $json = $content | ConvertFrom-Json } catch {} }
-    }
-
-    if     (-not $success) { $category = "FAILED" }
-    elseif ($isEmpty)      { $category = "EMPTY_RESPONSE" }
-    elseif ($noEhc)        { $category = "PASSED_NO_EHC" }
-    else                   { $category = "PASSED" }
-
-    switch ($category) {
-        "PASSED"         { Write-Host "[$i/$total] OK     BA=$baId EHC=$ehcId -> HTTP $httpStatus (attempts: $attemptsUsed)" -ForegroundColor Green }
-        "PASSED_NO_EHC"  { Write-Host "[$i/$total] OK*    BA=$baId (no EHC) -> HTTP $httpStatus (attempts: $attemptsUsed)" -ForegroundColor Green }
-        "EMPTY_RESPONSE" { Write-Host "[$i/$total] EMPTY  BA=$baId EHC=$ehcId -> HTTP $httpStatus but body is empty" -ForegroundColor Magenta }
-        "FAILED"         { Write-Host "[$i/$total] FAILED BA=$baId EHC=$ehcId ($rawEhc) -> HTTP $httpStatus | $errMsg | after $attemptsUsed attempts" -ForegroundColor Red }
-    }
-
-    $respEhc = ""; $respStatus = ""
-    if ($json) { $respEhc = $json.ehcId; $respStatus = $json.ehcStatus }
-
-    $results += @{
-        Row = $i; BAID = $baId; SentEHC = $ehcId; OriginalEHC = $rawEhc
-        Withdrawn = $cleaned; NoEHC = $noEhc; Category = $category
-        HttpStatus = $httpStatus; Attempts = $attemptsUsed
-        RespEHC = $respEhc; RespEHCStatus = $respStatus
-        Error = $errMsg; ErrorBody = $errBody
-        RetryHistory = ($retryErrors -join " | ")
-        Response = $content
-    }
-
-    Start-Sleep -Seconds $pauseBetween
 }
-
-# ================= SUMMARY =================
-$elapsed   = (Get-Date) - $startTime
-$passed    = @($results | Where-Object { $_.Category -eq "PASSED" })
-$passedNo  = @($results | Where-Object { $_.Category -eq "PASSED_NO_EHC" })
-$empty     = @($results | Where-Object { $_.Category -eq "EMPTY_RESPONSE" })
-$failed    = @($results | Where-Object { $_.Category -eq "FAILED" })
-$noEhcAll  = @($results | Where-Object { $_.NoEHC })
-$withdrawn = @($results | Where-Object { $_.Withdrawn })
-$retried   = @($results | Where-Object { $_.Attempts -gt 1 -and $_.Category -ne "FAILED" })
-$mismatch  = @($results | Where-Object { $_.Category -like "PASSED*" -and $_.SentEHC -and $_.RespEHC -and $_.SentEHC -ne $_.RespEHC })
-
-Write-Host "`n==================== FINAL SUMMARY ====================" -ForegroundColor Cyan
-Write-Host "Run time                     : $([int]$elapsed.TotalMinutes) min"
-Write-Host "Total records                : $total"
-Write-Host "PASSED (with EHC)            : $($passed.Count)"   -ForegroundColor Green
-Write-Host "PASSED (no EHC, tried anyway): $($passedNo.Count)" -ForegroundColor Green
-Write-Host "EMPTY response (HTTP OK)     : $($empty.Count)"    -ForegroundColor Magenta
-Write-Host "FAILED (after all retries)   : $($failed.Count)"   -ForegroundColor Red
-Write-Host "Had no EHC in input          : $($noEhcAll.Count)" -ForegroundColor Yellow
-Write-Host "(Withdrawn) cleaned          : $($withdrawn.Count)"
-Write-Host "Succeeded only after retry   : $($retried.Count)"
-
-Write-Host "`n---------- FAILED RECORDS ----------" -ForegroundColor Red
-if ($failed.Count -eq 0) { Write-Host "None" -ForegroundColor Green }
-else {
-    foreach ($f in $failed) {
-        Write-Host "Row $($f.Row) | BA=$($f.BAID) | SentEHC=$($f.SentEHC) | Original='$($f.OriginalEHC)'" -ForegroundColor Red
-        Write-Host "   HTTP   : $($f.HttpStatus)   Attempts: $($f.Attempts)"
-        Write-Host "   Error  : $($f.Error)"
-        Write-Host "   Body   : $($f.ErrorBody)"
-        Write-Host "   History: $($f.RetryHistory)"
-    }
-    Write-Host "`nFailures grouped by HTTP status:" -ForegroundColor Red
-    $failed | Group-Object { $_.HttpStatus } | ForEach-Object { Write-Host "   HTTP $($_.Name) : $($_.Count)" }
+finally {
+    # Runs on normal finish, auto-stop, and usually when you press Stop in ISE
+    Show-Summary
 }
-
-Write-Host "`n---------- EMPTY RESPONSES (HTTP success, no data) ----------" -ForegroundColor Magenta
-if ($empty.Count -eq 0) { Write-Host "None" -ForegroundColor Green }
-else { ShowRows $empty @('Row','BAID','SentEHC','OriginalEHC','HttpStatus') }
-
-Write-Host "`n---------- RECORDS WITH NO EHC (outcome of trying anyway) ----------" -ForegroundColor Yellow
-if ($noEhcAll.Count -eq 0) { Write-Host "None" }
-else { ShowRows $noEhcAll @('Row','BAID','OriginalEHC','Category','HttpStatus','Error') }
-
-Write-Host "`n---------- (Withdrawn) CLEANED ----------" -ForegroundColor Yellow
-if ($withdrawn.Count -eq 0) { Write-Host "None" }
-else { ShowRows $withdrawn @('Row','BAID','OriginalEHC','SentEHC','Category','HttpStatus') }
-
-Write-Host "`n---------- SUCCEEDED AFTER RETRY ----------" -ForegroundColor DarkYellow
-if ($retried.Count -eq 0) { Write-Host "None" }
-else { ShowRows $retried @('Row','BAID','SentEHC','Attempts','RetryHistory') }
-
-Write-Host "`n---------- SENT EHC != EHC RETURNED BY API ----------" -ForegroundColor Yellow
-if ($mismatch.Count -eq 0) { Write-Host "None" }
-else { ShowRows $mismatch @('Row','BAID','SentEHC','RespEHC','RespEHCStatus') }
-
-Write-Host "`nDone. Full data is in memory in `$results (nothing written to disk)." -ForegroundColor Cyan
