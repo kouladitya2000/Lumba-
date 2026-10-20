@@ -1,234 +1,281 @@
 # ================= CONFIG =================
-$csvPath      = "C:\Users\45270978\Desktop\TagsValidator\SingleFinalEHC_20261020_030404.csv"  # read-only
-$baseUrl      = "https://cstmg-fa-euw-01.cstmg-ase-euw-01.appserviceenvironment.net"
-$faCode       = "PASTE_YOUR_FACODE_HERE"   # same value as your working script
-$maxRetries   = 4
-$baseDelay    = 5     # seconds before first retry, doubles each time (5, 10, 20)
-$pauseBetween = 3     # seconds between records (gentle on the API)
-$stopAfterConsecutiveFails = 5   # auto-stop if this many EHC records fail in a row (0 = never)
+$csvPath      = "C:\Users\45270978\Desktop\TagsValidator\SingleFinalEHC_20261020_030404.csv"   # read-only input
+$auditFolder  = "C:\Users\45270978\Desktop\TagsValidator\Audit"                                # audit CSV goes here
+$tagName      = "EHC ID"
+$dryRun       = $true     # $true = read only, log what WOULD change. Set $false to really update.
+$pauseBetween = 1         # seconds between subscriptions
 # ==========================================
 
-# ---------- Ask for start / end row ----------
-Write-Host "Enter Excel row numbers (header = row 1, first record = row 2)" -ForegroundColor Cyan
-$inStart = Read-Host "Start from Excel row (press Enter for 2)"
-$inEnd   = Read-Host "Stop at Excel row (press Enter for last row)"
-
-$rows  = @(Import-Csv -Path $csvPath)
-$total = $rows.Count
-$lastExcel = $total + 1
-
-$startExcel = 2
-if ($inStart -match '^\d+$') { $startExcel = [int]$inStart }
-if ($startExcel -lt 2) { $startExcel = 2 }
-
-$endExcel = $lastExcel
-if ($inEnd -match '^\d+$' -and [int]$inEnd -ge $startExcel -and [int]$inEnd -lt $lastExcel) { $endExcel = [int]$inEnd }
-
-if ($startExcel -gt $lastExcel) {
-    Write-Host "Start row $startExcel is beyond the last row ($lastExcel). Nothing to do." -ForegroundColor Red
+# ---------- Azure login check ----------
+$ctx = Get-AzContext
+if (-not $ctx) {
+    Write-Host "Not logged in to Azure. Run Connect-AzAccount first, then re-run this script." -ForegroundColor Red
     return
 }
+Write-Host "Azure account : $($ctx.Account.Id)" -ForegroundColor Cyan
 
-$processed = $endExcel - $startExcel + 1
-$results   = @()
-$startTime = Get-Date
-$lastDone  = 0
-$consecFails = 0
-$stoppedEarly = $false
+# ---------- Audit file ----------
+if (-not (Test-Path $auditFolder)) { [void](New-Item -ItemType Directory -Path $auditFolder -Force) }
+$stamp    = Get-Date -Format "yyyyMMdd_HHmmss"
+$auditCsv = Join-Path $auditFolder "EHC_Tag_Audit_$stamp.csv"
+
+# ---------- Load CSV ----------
+$rows  = @(Import-Csv -Path $csvPath)
+$total = $rows.Count
+if ($total -eq 0) { Write-Host "CSV has no records." -ForegroundColor Red; return }
+
+$headers = @($rows[0].PSObject.Properties | ForEach-Object { $_.Name })
+foreach ($h in @('SubscriptionName','SubscriptionId','EHC ID')) {
+    if ($headers -notcontains $h) {
+        Write-Host "Column '$h' not found in CSV. Headers found: $($headers -join ', ')" -ForegroundColor Red
+        return
+    }
+}
+
+$modeText = "LIVE - tags WILL be updated"
+if ($dryRun) { $modeText = "DRY RUN - nothing will be changed" }
 
 Write-Host "`n############################################################" -ForegroundColor Cyan
-Write-Host "RUN STARTED: Excel rows $startExcel to $endExcel ($processed records)" -ForegroundColor Cyan
-Write-Host "File has $total records (Excel rows 2 to $lastExcel)" -ForegroundColor Cyan
+Write-Host "MODE : $modeText" -ForegroundColor Yellow
+Write-Host "RUN  : $total subscriptions from file" -ForegroundColor Cyan
+Write-Host "AUDIT: $auditCsv" -ForegroundColor Cyan
 Write-Host "############################################################`n" -ForegroundColor Cyan
 
-function ShowRows($list, $fields) {
-    foreach ($r in $list) {
-        $parts = @()
-        foreach ($f in $fields) { $parts += "$f=$($r[$f])" }
-        Write-Host ("   " + ($parts -join " | "))
+# ---------- Helpers ----------
+function Get-SubTags($subId) {
+    $res = Get-AzTag -ResourceId "/subscriptions/$subId" -ErrorAction Stop
+    $h = @{}
+    if ($res -and $res.Properties -and $res.Properties.TagsProperty) {
+        foreach ($k in $res.Properties.TagsProperty.Keys) { $h[$k] = $res.Properties.TagsProperty[$k] }
     }
+    return $h
+}
+
+function Tags-ToText($h) {
+    if ($h -eq $null -or $h.Count -eq 0) { return "{}" }
+    $parts = @()
+    foreach ($k in ($h.Keys | Sort-Object)) { $parts += "$k=$($h[$k])" }
+    return ($parts -join "; ")
+}
+
+function Write-Audit($r) {
+    $o = "" | Select-Object Timestamp, FileRow, SubscriptionName, SubscriptionId, Status, OldEHC, NewEHC, TagsBefore, TagsAfter, Message
+    $o.Timestamp        = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $o.FileRow          = $r.Row
+    $o.SubscriptionName = $r.SubName
+    $o.SubscriptionId   = $r.SubId
+    $o.Status           = $r.Status
+    $o.OldEHC           = $r.OldEHC
+    $o.NewEHC           = $r.NewEHC
+    $o.TagsBefore       = $r.TagsBefore
+    $o.TagsAfter        = $r.TagsAfter
+    $o.Message          = $r.Message
+    $o | Export-Csv -Path $auditCsv -Append -NoTypeInformation
 }
 
 function Show-Summary {
-    $elapsed   = (Get-Date) - $startTime
-    $passed    = @($results | Where-Object { $_.Category -eq "PASSED" }        | Sort-Object { $_.ExcelRow })
-    $passedNo  = @($results | Where-Object { $_.Category -eq "PASSED_NO_EHC" } | Sort-Object { $_.ExcelRow })
-    $empty     = @($results | Where-Object { $_.Category -eq "EMPTY_RESPONSE" } | Sort-Object { $_.ExcelRow })
-    $failed    = @($results | Where-Object { $_.Category -eq "FAILED" }        | Sort-Object { $_.ExcelRow })
-    $noEhcAll  = @($results | Where-Object { $_.NoEHC }       | Sort-Object { $_.ExcelRow })
-    $withdrawn = @($results | Where-Object { $_.Withdrawn }   | Sort-Object { $_.ExcelRow })
-    $retried   = @($results | Where-Object { $_.Attempts -gt 1 -and $_.Category -ne "FAILED" } | Sort-Object { $_.ExcelRow })
-    $mismatch  = @($results | Where-Object { $_.Category -like "PASSED*" -and $_.SentEHC -and $_.RespEHC -and $_.SentEHC -ne $_.RespEHC } | Sort-Object { $_.ExcelRow })
-    $failedWithEhc = @($failed | Where-Object { -not $_.NoEHC })
+    $elapsed  = (Get-Date) - $startTime
+    $updated  = @($results | Where-Object { $_.Status -eq "UPDATED" })
+    $wouldUpd = @($results | Where-Object { $_.Status -eq "DRYRUN_WOULD_UPDATE" })
+    $same     = @($results | Where-Object { $_.Status -eq "ALREADY_SET" })
+    $noEhc    = @($results | Where-Object { $_.Status -eq "SKIPPED_NO_EHC" })
+    $badId    = @($results | Where-Object { $_.Status -eq "SKIPPED_BAD_SUBID" })
+    $failed   = @($results | Where-Object { $_.Status -eq "FAILED" })
+    $otherChg = @($results | Where-Object { $_.Status -eq "UPDATED_BUT_OTHER_TAGS_CHANGED" })
+    $cleaned  = @($results | Where-Object { $_.Cleaned })
+    $dupes    = @($results | Where-Object { $_.Duplicate })
 
     Write-Host "`n==================== FINAL SUMMARY ====================" -ForegroundColor Cyan
-    if ($results.Count -gt 0) {
-        Write-Host "Excel rows covered           : $($results[0].ExcelRow) to $lastDone"
-    }
+    Write-Host "Mode                         : $modeText"
     Write-Host "Run time                     : $([int]$elapsed.TotalMinutes) min"
-    Write-Host "Records processed            : $($results.Count) of $processed planned"
-    Write-Host "PASSED (with EHC)            : $($passed.Count)"   -ForegroundColor Green
-    Write-Host "PASSED (no EHC, tried anyway): $($passedNo.Count)" -ForegroundColor Green
-    Write-Host "EMPTY response (HTTP OK)     : $($empty.Count)"    -ForegroundColor Magenta
-    Write-Host "FAILED (after all retries)   : $($failed.Count)"   -ForegroundColor Red
-    Write-Host "   of which had a valid EHC  : $($failedWithEhc.Count)" -ForegroundColor Red
-    Write-Host "Had no EHC in input          : $($noEhcAll.Count)" -ForegroundColor Yellow
-    Write-Host "(Withdrawn) cleaned          : $($withdrawn.Count)"
-    Write-Host "Succeeded only after retry   : $($retried.Count)"
+    Write-Host "Processed                    : $($results.Count) of $total"
+    Write-Host "UPDATED                      : $($updated.Count)"  -ForegroundColor Green
+    Write-Host "DRY RUN would update         : $($wouldUpd.Count)" -ForegroundColor Yellow
+    Write-Host "Already had same EHC ID      : $($same.Count)"
+    Write-Host "SKIPPED - no EHC in file     : $($noEhc.Count)"    -ForegroundColor Yellow
+    Write-Host "SKIPPED - bad subscription id: $($badId.Count)"   -ForegroundColor Yellow
+    Write-Host "FAILED                       : $($failed.Count)"   -ForegroundColor Red
+    Write-Host "OTHER TAGS CHANGED (check!)  : $($otherChg.Count)" -ForegroundColor Red
+    Write-Host "(Withdrawn) cleaned          : $($cleaned.Count)"
+    Write-Host "Duplicate subscription ids   : $($dupes.Count)"
 
-    Write-Host "`n---------- FAILED RECORDS ----------" -ForegroundColor Red
+    Write-Host "`n---------- FAILED ----------" -ForegroundColor Red
     if ($failed.Count -eq 0) { Write-Host "None" -ForegroundColor Green }
-    else {
-        foreach ($f in $failed) {
-            Write-Host "Excel row $($f.ExcelRow) | BA=$($f.BAID) | SentEHC=$($f.SentEHC) | Original='$($f.OriginalEHC)'" -ForegroundColor Red
-            Write-Host "   HTTP   : $($f.HttpStatus)   Attempts: $($f.Attempts)"
-            Write-Host "   Error  : $($f.Error)"
-            Write-Host "   Body   : $($f.ErrorBody)"
-            Write-Host "   History: $($f.RetryHistory)"
-        }
-        Write-Host "`nFailures grouped by HTTP status:" -ForegroundColor Red
-        $failed | Group-Object { $_.HttpStatus } | ForEach-Object { Write-Host "   HTTP $($_.Name) : $($_.Count)" }
-        $rowList = @()
-        foreach ($f in $failedWithEhc) { $rowList += $f.ExcelRow }
-        if ($rowList.Count -gt 0) {
-            Write-Host "`nExcel rows to re-run (failed WITH a valid EHC): $($rowList -join ', ')" -ForegroundColor Red
-        }
+    foreach ($r in $failed) {
+        Write-Host "Row $($r.Row) | $($r.SubName) | $($r.SubId) | EHC=$($r.NewEHC)" -ForegroundColor Red
+        Write-Host "   Error: $($r.Message)"
     }
 
-    Write-Host "`n---------- EMPTY RESPONSES (HTTP success, no data) ----------" -ForegroundColor Magenta
-    if ($empty.Count -eq 0) { Write-Host "None" -ForegroundColor Green }
-    else { ShowRows $empty @('ExcelRow','BAID','SentEHC','OriginalEHC','HttpStatus') }
+    Write-Host "`n---------- OTHER TAGS CHANGED (investigate) ----------" -ForegroundColor Red
+    if ($otherChg.Count -eq 0) { Write-Host "None" -ForegroundColor Green }
+    foreach ($r in $otherChg) {
+        Write-Host "Row $($r.Row) | $($r.SubName) | $($r.SubId)" -ForegroundColor Red
+        Write-Host "   $($r.Message)"
+    }
 
-    Write-Host "`n---------- RECORDS WITH NO EHC (outcome of trying anyway) ----------" -ForegroundColor Yellow
-    if ($noEhcAll.Count -eq 0) { Write-Host "None" }
-    else { ShowRows $noEhcAll @('ExcelRow','BAID','OriginalEHC','Category','HttpStatus','Error') }
+    Write-Host "`n---------- SKIPPED: NO EHC IN FILE (tags not touched) ----------" -ForegroundColor Yellow
+    if ($noEhc.Count -eq 0) { Write-Host "None" }
+    foreach ($r in $noEhc) { Write-Host "Row $($r.Row) | $($r.SubName) | $($r.SubId) | file value='$($r.OrigEHC)' | current tag='$($r.OldEHC)'" }
+
+    Write-Host "`n---------- SKIPPED: BAD SUBSCRIPTION ID ----------" -ForegroundColor Yellow
+    if ($badId.Count -eq 0) { Write-Host "None" }
+    foreach ($r in $badId) { Write-Host "Row $($r.Row) | $($r.SubName) | id='$($r.SubId)'" }
 
     Write-Host "`n---------- (Withdrawn) CLEANED ----------" -ForegroundColor Yellow
-    if ($withdrawn.Count -eq 0) { Write-Host "None" }
-    else { ShowRows $withdrawn @('ExcelRow','BAID','OriginalEHC','SentEHC','Category','HttpStatus') }
+    if ($cleaned.Count -eq 0) { Write-Host "None" }
+    foreach ($r in $cleaned) { Write-Host "Row $($r.Row) | $($r.SubName) | '$($r.OrigEHC)' -> '$($r.NewEHC)'" }
 
-    Write-Host "`n---------- SUCCEEDED AFTER RETRY ----------" -ForegroundColor DarkYellow
-    if ($retried.Count -eq 0) { Write-Host "None" }
-    else { ShowRows $retried @('ExcelRow','BAID','SentEHC','Attempts','RetryHistory') }
-
-    Write-Host "`n---------- SENT EHC != EHC RETURNED BY API ----------" -ForegroundColor Yellow
-    if ($mismatch.Count -eq 0) { Write-Host "None" }
-    else { ShowRows $mismatch @('ExcelRow','BAID','SentEHC','RespEHC','RespEHCStatus') }
+    Write-Host "`n---------- ALREADY SET (no change needed) ----------" -ForegroundColor DarkGray
+    if ($same.Count -eq 0) { Write-Host "None" }
+    foreach ($r in $same) { Write-Host "Row $($r.Row) | $($r.SubName) | EHC ID already '$($r.NewEHC)'" }
 
     Write-Host "`n############################################################" -ForegroundColor Cyan
-    if ($lastDone -gt 0) {
-        Write-Host "LAST EXCEL ROW PROCESSED: $lastDone" -ForegroundColor Cyan
-        if ($lastDone -lt $lastExcel) {
-            Write-Host "NEXT RUN: start from Excel row $($lastDone + 1)" -ForegroundColor Cyan
-        } else {
-            Write-Host "End of file reached." -ForegroundColor Cyan
-        }
-    }
+    Write-Host "AUDIT FILE: $auditCsv" -ForegroundColor Cyan
     Write-Host "############################################################" -ForegroundColor Cyan
-    Write-Host "Full data is in memory in `$results (nothing written to disk)." -ForegroundColor DarkGray
 }
 
 # ================= MAIN LOOP =================
+$results   = @()
+$seenIds   = @{}
+$startTime = Get-Date
+
 try {
-    for ($excelRow = $startExcel; $excelRow -le $endExcel; $excelRow++) {
-        $row  = $rows[$excelRow - 2]
-        $pos  = $excelRow - $startExcel + 1
-        $tag  = "[Excel row $excelRow | $pos/$processed]"
+    for ($i = 1; $i -le $total; $i++) {
+        $row = $rows[$i - 1]
+        $tag = "[$i/$total]"
 
-        $baId   = ("" + $row.'BA ID').Trim()
-        $rawEhc = ("" + $row.'EHC ID').Trim()
-        $ehcId  = ($rawEhc -replace '\(.*?\)', '').Trim()
-        $cleaned = ($ehcId -ne $rawEhc)
+        $subName = ("" + $row.'SubscriptionName').Trim()
+        $subId   = ("" + $row.'SubscriptionId').Trim()
+        $origEhc = ("" + $row.'EHC ID').Trim()
+        $newEhc  = ($origEhc -replace '\(.*?\)', '').Trim()
+        $cleaned = ($newEhc -ne $origEhc)
 
-        $noEhc = $false
-        if ($ehcId -eq "" -or $ehcId -match 'NO EHC FOUND' -or $ehcId -match '^API ERROR') {
-            $noEhc = $true
-            $ehcId = ""
-            Write-Host "$tag WARN   BA=$baId has no EHC ('$rawEhc') - trying with empty ehcId" -ForegroundColor Yellow
-        }
-        if ($cleaned) {
-            Write-Host "$tag INFO   cleaned '$rawEhc' -> '$ehcId'" -ForegroundColor DarkGray
+        $rec = @{
+            Row = $i; SubName = $subName; SubId = $subId; OrigEHC = $origEhc
+            NewEHC = $newEhc; OldEHC = ""; Status = ""; Message = ""
+            TagsBefore = ""; TagsAfter = ""; Cleaned = $cleaned; Duplicate = $false
         }
 
-        $url = "$baseUrl/api/GetBAData?baid=$baId&ehcId=$ehcId&$faCode"
+        # --- validate subscription id ---
+        if ($subId -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+            $rec.Status  = "SKIPPED_BAD_SUBID"
+            $rec.Message = "Subscription id is not a valid GUID"
+            Write-Host "$tag SKIP   $subName - bad subscription id '$subId'" -ForegroundColor Yellow
+            $results += $rec; Write-Audit $rec
+            continue
+        }
 
-        $success = $false; $httpStatus = ""; $content = $null
-        $errMsg = ""; $errBody = ""; $attemptsUsed = 0; $retryErrors = @()
-        $wait = $baseDelay
+        if ($seenIds.ContainsKey($subId)) {
+            $rec.Duplicate = $true
+            Write-Host "$tag WARN   duplicate subscription id (first seen at row $($seenIds[$subId]))" -ForegroundColor Yellow
+        } else { $seenIds[$subId] = $i }
 
-        for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
-            $attemptsUsed = $attempt
-            try {
-                $resp = Invoke-WebRequest -UseBasicParsing -Uri $url -Method GET -ContentType "application/json" -TimeoutSec 60
-                $content = $resp.Content
-                $httpStatus = [int]$resp.StatusCode
-                $success = $true
-                break
+        if ($cleaned) { Write-Host "$tag INFO   cleaned '$origEhc' -> '$newEhc'" -ForegroundColor DarkGray }
+
+        # --- read tags BEFORE ---
+        $before = $null
+        try { $before = Get-SubTags $subId }
+        catch {
+            $rec.Status  = "FAILED"
+            $rec.Message = "Could not read tags: $($_.Exception.Message)"
+            Write-Host "$tag FAILED $subName ($subId) - could not read tags: $($_.Exception.Message)" -ForegroundColor Red
+            $results += $rec; Write-Audit $rec
+            continue
+        }
+
+        $rec.TagsBefore = Tags-ToText $before
+        $oldEhc = ""
+        if ($before.ContainsKey($tagName)) { $oldEhc = "" + $before[$tagName] }
+        $rec.OldEHC = $oldEhc
+
+        # --- no EHC in file: log only ---
+        if ($newEhc -eq "" -or $newEhc -match 'NO EHC FOUND' -or $newEhc -match '^API ERROR') {
+            $rec.NewEHC    = ""
+            $rec.Status    = "SKIPPED_NO_EHC"
+            $rec.Message   = "No EHC ID in file ('$origEhc'). Tags not touched."
+            $rec.TagsAfter = $rec.TagsBefore
+            Write-Host "$tag SKIP   $subName ($subId) - NO EHC in file ('$origEhc'). Current tag value: '$oldEhc'. Not touched." -ForegroundColor Yellow
+            $results += $rec; Write-Audit $rec
+            continue
+        }
+
+        # --- already correct ---
+        if ($oldEhc -ceq $newEhc) {
+            $rec.Status    = "ALREADY_SET"
+            $rec.Message   = "EHC ID already has the correct value"
+            $rec.TagsAfter = $rec.TagsBefore
+            Write-Host "$tag SAME   $subName - EHC ID already '$newEhc'" -ForegroundColor DarkGray
+            $results += $rec; Write-Audit $rec
+            continue
+        }
+
+        # --- dry run ---
+        if ($dryRun) {
+            $rec.Status    = "DRYRUN_WOULD_UPDATE"
+            $rec.Message   = "Dry run - no change made"
+            $rec.TagsAfter = $rec.TagsBefore
+            Write-Host "$tag DRYRUN $subName ($subId) - EHC ID '$oldEhc' -> '$newEhc'" -ForegroundColor Yellow
+            $results += $rec; Write-Audit $rec
+            continue
+        }
+
+        # --- real update (Merge = only EHC ID is added/changed) ---
+        try {
+            [void](Update-AzTag -ResourceId "/subscriptions/$subId" -Tag @{ $tagName = $newEhc } -Operation Merge -ErrorAction Stop)
+        }
+        catch {
+            $rec.Status    = "FAILED"
+            $rec.Message   = "Update failed: $($_.Exception.Message)"
+            $rec.TagsAfter = $rec.TagsBefore
+            Write-Host "$tag FAILED $subName ($subId) - update error: $($_.Exception.Message)" -ForegroundColor Red
+            $results += $rec; Write-Audit $rec
+            continue
+        }
+
+        # --- read tags AFTER and verify nothing else changed ---
+        $after = $null
+        try { $after = Get-SubTags $subId } catch { $rec.Message = "Updated, but could not re-read tags: $($_.Exception.Message)" }
+
+        if ($after -ne $null) {
+            $rec.TagsAfter = Tags-ToText $after
+            $problems = @()
+            foreach ($k in $before.Keys) {
+                if ($k -eq $tagName) { continue }
+                if (-not $after.ContainsKey($k)) { $problems += "tag '$k' MISSING after update" }
+                elseif ("" + $after[$k] -cne "" + $before[$k]) { $problems += "tag '$k' changed '$($before[$k])' -> '$($after[$k])'" }
             }
-            catch {
-                $code = ""
-                if ($_.Exception.Response) { try { $code = [int]$_.Exception.Response.StatusCode } catch {} }
-                $httpStatus = $code
-                $errMsg  = $_.Exception.Message
-                $errBody = ""
-                if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errBody = $_.ErrorDetails.Message }
-                $retryErrors += "attempt $attempt : HTTP $code - $errMsg"
+            foreach ($k in $after.Keys) {
+                if ($k -eq $tagName) { continue }
+                if (-not $before.ContainsKey($k)) { $problems += "tag '$k' NEW after update" }
+            }
+            $afterEhc = ""
+            if ($after.ContainsKey($tagName)) { $afterEhc = "" + $after[$tagName] }
 
-                if ($attempt -lt $maxRetries) {
-                    Write-Host "$tag RETRY  $attempt/$maxRetries BA=$baId EHC=$ehcId -> HTTP $code $errMsg Waiting ${wait}s" -ForegroundColor DarkYellow
-                    Start-Sleep -Seconds $wait
-                    $wait = $wait * 2
-                }
+            if ($problems.Count -gt 0) {
+                $rec.Status  = "UPDATED_BUT_OTHER_TAGS_CHANGED"
+                $rec.Message = ($problems -join " | ")
+                Write-Host "$tag ALERT  $subName ($subId) - other tags differ after update: $($rec.Message)" -ForegroundColor Red
+            }
+            elseif ($afterEhc -cne $newEhc) {
+                $rec.Status  = "FAILED"
+                $rec.Message = "Update call succeeded but EHC ID reads '$afterEhc' instead of '$newEhc'"
+                Write-Host "$tag FAILED $subName ($subId) - $($rec.Message)" -ForegroundColor Red
+            }
+            else {
+                $rec.Status  = "UPDATED"
+                $rec.Message = "EHC ID updated, other tags verified unchanged"
+                Write-Host "$tag OK     $subName ($subId) - EHC ID '$oldEhc' -> '$newEhc' | other tags verified unchanged" -ForegroundColor Green
             }
         }
-
-        $isEmpty = $false; $json = $null
-        if ($success) {
-            if ($content -eq $null -or $content.Trim() -eq "" -or $content.Trim() -match '^(\[\]|\{\}|null)$') { $isEmpty = $true }
-            else { try { $json = $content | ConvertFrom-Json } catch {} }
+        else {
+            $rec.Status = "UPDATED"
+            Write-Host "$tag OK*    $subName ($subId) - EHC ID '$oldEhc' -> '$newEhc' | $($rec.Message)" -ForegroundColor Yellow
         }
 
-        if     (-not $success) { $category = "FAILED" }
-        elseif ($isEmpty)      { $category = "EMPTY_RESPONSE" }
-        elseif ($noEhc)        { $category = "PASSED_NO_EHC" }
-        else                   { $category = "PASSED" }
-
-        switch ($category) {
-            "PASSED"         { Write-Host "$tag OK     BA=$baId EHC=$ehcId -> HTTP $httpStatus (attempts: $attemptsUsed)" -ForegroundColor Green }
-            "PASSED_NO_EHC"  { Write-Host "$tag OK*    BA=$baId (no EHC) -> HTTP $httpStatus (attempts: $attemptsUsed)" -ForegroundColor Green }
-            "EMPTY_RESPONSE" { Write-Host "$tag EMPTY  BA=$baId EHC=$ehcId -> HTTP $httpStatus but body is empty" -ForegroundColor Magenta }
-            "FAILED"         { Write-Host "$tag FAILED BA=$baId EHC=$ehcId ('$rawEhc') -> HTTP $httpStatus | $errMsg | after $attemptsUsed attempts" -ForegroundColor Red }
-        }
-
-        $respEhc = ""; $respStatus = ""
-        if ($json) { $respEhc = $json.ehcId; $respStatus = $json.ehcStatus }
-
-        $results += @{
-            ExcelRow = $excelRow; BAID = $baId; SentEHC = $ehcId; OriginalEHC = $rawEhc
-            Withdrawn = $cleaned; NoEHC = $noEhc; Category = $category
-            HttpStatus = $httpStatus; Attempts = $attemptsUsed
-            RespEHC = $respEhc; RespEHCStatus = $respStatus
-            Error = $errMsg; ErrorBody = $errBody
-            RetryHistory = ($retryErrors -join " | ")
-            Response = $content
-        }
-        $lastDone = $excelRow
-
-        # Auto-stop if API looks like it is throttling (only counts records that HAD an EHC)
-        if ($category -eq "FAILED" -and -not $noEhc) { $consecFails++ }
-        elseif ($category -ne "FAILED") { $consecFails = 0 }
-
-        if ($stopAfterConsecutiveFails -gt 0 -and $consecFails -ge $stopAfterConsecutiveFails) {
-            Write-Host "`n!!! $consecFails consecutive failures with valid EHC. Stopping so you can wait and resume." -ForegroundColor Red
-            Write-Host "!!! Resume from Excel row $($excelRow - $consecFails + 1) (first of the failing streak)" -ForegroundColor Red
-            $stoppedEarly = $true
-            break
-        }
-
+        $results += $rec; Write-Audit $rec
         Start-Sleep -Seconds $pauseBetween
     }
 }
 finally {
-    # Runs on normal finish, auto-stop, and usually when you press Stop in ISE
     Show-Summary
 }
