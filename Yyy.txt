@@ -1,30 +1,23 @@
 # ---------- CONFIG ----------
-$csvPath      = "C:\path\to\SingleFinalEHC_20261020_030404.csv"   # input (read-only)
+$csvPath      = "C:\Users\45270978\Desktop\TagsValidator\SingleFinalEHC_20261020_030404.csv"  # read-only
 $baseUrl      = "https://cstmg-fa-euw-01.cstmg-ase-euw-01.appserviceenvironment.net"
 $faCode       = "PASTE_YOUR_FACODE_HERE"   # same value as your working script
 $maxRetries   = 4
 $baseDelay    = 3      # seconds, doubles each retry (3, 6, 12)
-$pauseBetween = 1      # seconds between records
+$pauseBetween = 1
 # ----------------------------
 
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-function Get-ErrorDetail($err) {
-    $code = $null; $body = $null
-    if ($err.Exception.Response) { try { $code = [int]$err.Exception.Response.StatusCode } catch {} }
-    try {
-        if ($err.ErrorDetails -and $err.ErrorDetails.Message) { $body = $err.ErrorDetails.Message }
-        elseif ($err.Exception.Response) {
-            $sr = New-Object IO.StreamReader($err.Exception.Response.GetResponseStream())
-            $body = $sr.ReadToEnd(); $sr.Close()
-        }
-    } catch {}
-    [pscustomobject]@{ Code = $code; Message = $err.Exception.Message; Body = $body }
+function ShowRows($list, $fields) {
+    foreach ($r in $list) {
+        $parts = @()
+        foreach ($f in $fields) { $parts += "$f=$($r[$f])" }
+        Write-Host ("   " + ($parts -join " | "))
+    }
 }
 
 $rows    = Import-Csv -Path $csvPath
-$total   = $rows.Count
-$results = New-Object System.Collections.ArrayList
+$total   = @($rows).Count
+$results = @()
 $i = 0
 $startTime = Get-Date
 
@@ -44,10 +37,11 @@ foreach ($row in $rows) {
         Write-Host "[$i/$total] WARN   BA=$baId has no EHC ('$rawEhc') - trying with empty ehcId" -ForegroundColor Yellow
     }
 
-    $url = "$baseUrl/api/GetBAData?baid=$([uri]::EscapeDataString($baId))&ehcId=$([uri]::EscapeDataString($ehcId))&$faCode"
+    $url = "$baseUrl/api/GetBAData?baid=$baId&ehcId=$ehcId&$faCode"
 
-    $success = $false; $httpStatus = $null; $content = $null
+    $success = $false; $httpStatus = ""; $content = $null
     $errMsg = ""; $errBody = ""; $attemptsUsed = 0; $retryErrors = @()
+    $wait = $baseDelay
 
     for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
         $attemptsUsed = $attempt
@@ -59,21 +53,22 @@ foreach ($row in $rows) {
             break
         }
         catch {
-            $d = Get-ErrorDetail $_
-            $httpStatus = $d.Code
-            $errMsg  = $d.Message
-            $errBody = $d.Body
-            $retryErrors += "attempt $attempt : HTTP $($d.Code) - $($d.Message)"
+            $code = ""
+            if ($_.Exception.Response) { try { $code = [int]$_.Exception.Response.StatusCode } catch {} }
+            $httpStatus = $code
+            $errMsg  = $_.Exception.Message
+            $errBody = ""
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errBody = $_.ErrorDetails.Message }
+            $retryErrors += "attempt $attempt : HTTP $code - $errMsg"
 
             if ($attempt -lt $maxRetries) {
-                $wait = $baseDelay * [math]::Pow(2, $attempt - 1)
-                Write-Host "[$i/$total] RETRY  $attempt/$maxRetries BA=$baId EHC=$ehcId -> HTTP $($d.Code) $($d.Message). Waiting ${wait}s" -ForegroundColor DarkYellow
+                Write-Host "[$i/$total] RETRY  $attempt/$maxRetries BA=$baId EHC=$ehcId -> HTTP $code $errMsg. Waiting ${wait}s" -ForegroundColor DarkYellow
                 Start-Sleep -Seconds $wait
+                $wait = $wait * 2
             }
         }
     }
 
-    # Classify
     $isEmpty = $false; $json = $null
     if ($success) {
         if ([string]::IsNullOrWhiteSpace($content) -or $content.Trim() -match '^(\[\]|\{\}|null)$') { $isEmpty = $true }
@@ -88,19 +83,22 @@ foreach ($row in $rows) {
     switch ($category) {
         "PASSED"         { Write-Host "[$i/$total] OK     BA=$baId EHC=$ehcId -> HTTP $httpStatus (attempts: $attemptsUsed)" -ForegroundColor Green }
         "PASSED_NO_EHC"  { Write-Host "[$i/$total] OK*    BA=$baId (no EHC) -> HTTP $httpStatus (attempts: $attemptsUsed)" -ForegroundColor Green }
-        "EMPTY_RESPONSE" { Write-Host "[$i/$total] EMPTY  BA=$baId EHC=$ehcId -> HTTP $httpStatus but response body is empty" -ForegroundColor Magenta }
+        "EMPTY_RESPONSE" { Write-Host "[$i/$total] EMPTY  BA=$baId EHC=$ehcId -> HTTP $httpStatus but body is empty" -ForegroundColor Magenta }
         "FAILED"         { Write-Host "[$i/$total] FAILED BA=$baId EHC=$ehcId ($rawEhc) -> HTTP $httpStatus | $errMsg | after $attemptsUsed attempts" -ForegroundColor Red }
     }
 
-    [void]$results.Add([pscustomobject]@{
+    $respEhc = ""; $respStatus = ""
+    if ($json) { $respEhc = $json.ehcId; $respStatus = $json.ehcStatus }
+
+    $results += @{
         Row = $i; BAID = $baId; SentEHC = $ehcId; OriginalEHC = $rawEhc
         Withdrawn = $cleaned; NoEHC = $noEhc; Category = $category
         HttpStatus = $httpStatus; Attempts = $attemptsUsed
-        RespBAID = $json.busapp_id; RespEHC = $json.ehcId; RespEHCStatus = $json.ehcStatus
+        RespEHC = $respEhc; RespEHCStatus = $respStatus
         Error = $errMsg; ErrorBody = $errBody
         RetryHistory = ($retryErrors -join " | ")
         Response = $content
-    })
+    }
 
     Start-Sleep -Seconds $pauseBetween
 }
@@ -114,60 +112,51 @@ $failed    = @($results | Where-Object { $_.Category -eq "FAILED" })
 $noEhcAll  = @($results | Where-Object { $_.NoEHC })
 $withdrawn = @($results | Where-Object { $_.Withdrawn })
 $retried   = @($results | Where-Object { $_.Attempts -gt 1 -and $_.Category -ne "FAILED" })
-
-function Show($rows, $props) { ($rows | Format-Table $props -AutoSize -Wrap | Out-String -Width 250) | Write-Host }
+$mismatch  = @($results | Where-Object { $_.Category -like "PASSED*" -and $_.SentEHC -and $_.RespEHC -and $_.SentEHC -ne $_.RespEHC })
 
 Write-Host "`n==================== FINAL SUMMARY ====================" -ForegroundColor Cyan
-Write-Host "Run time                    : $([math]::Round($elapsed.TotalMinutes,1)) min"
-Write-Host "Total records               : $total"
-Write-Host "PASSED (with EHC)           : $($passed.Count)"   -ForegroundColor Green
+Write-Host "Run time                     : $([int]$elapsed.TotalMinutes) min"
+Write-Host "Total records                : $total"
+Write-Host "PASSED (with EHC)            : $($passed.Count)"   -ForegroundColor Green
 Write-Host "PASSED (no EHC, tried anyway): $($passedNo.Count)" -ForegroundColor Green
-Write-Host "EMPTY response (HTTP OK)    : $($empty.Count)"    -ForegroundColor Magenta
-Write-Host "FAILED (after all retries)  : $($failed.Count)"   -ForegroundColor Red
-Write-Host "Had no EHC in input         : $($noEhcAll.Count)" -ForegroundColor Yellow
-Write-Host "(Withdrawn) cleaned         : $($withdrawn.Count)"
-Write-Host "Succeeded only after retry  : $($retried.Count)"
+Write-Host "EMPTY response (HTTP OK)     : $($empty.Count)"    -ForegroundColor Magenta
+Write-Host "FAILED (after all retries)   : $($failed.Count)"   -ForegroundColor Red
+Write-Host "Had no EHC in input          : $($noEhcAll.Count)" -ForegroundColor Yellow
+Write-Host "(Withdrawn) cleaned          : $($withdrawn.Count)"
+Write-Host "Succeeded only after retry   : $($retried.Count)"
 
-# ---- FAILED ----
 Write-Host "`n---------- FAILED RECORDS ----------" -ForegroundColor Red
 if ($failed.Count -eq 0) { Write-Host "None" -ForegroundColor Green }
 else {
-    Show $failed @('Row','BAID','SentEHC','OriginalEHC','HttpStatus','Attempts','Error')
-    Write-Host "Failures grouped by HTTP status:" -ForegroundColor Red
-    Show ($failed | Group-Object HttpStatus | Sort-Object Count -Descending) @('Count','Name')
-    Write-Host "Error body / retry history per failure:" -ForegroundColor Red
     foreach ($f in $failed) {
-        Write-Host "Row $($f.Row) BA=$($f.BAID) EHC=$($f.SentEHC)" -ForegroundColor Red
+        Write-Host "Row $($f.Row) | BA=$($f.BAID) | SentEHC=$($f.SentEHC) | Original='$($f.OriginalEHC)'" -ForegroundColor Red
+        Write-Host "   HTTP   : $($f.HttpStatus)   Attempts: $($f.Attempts)"
+        Write-Host "   Error  : $($f.Error)"
         Write-Host "   Body   : $($f.ErrorBody)"
         Write-Host "   History: $($f.RetryHistory)"
     }
+    Write-Host "`nFailures grouped by HTTP status:" -ForegroundColor Red
+    $failed | Group-Object { $_.HttpStatus } | ForEach-Object { Write-Host "   HTTP $($_.Name) : $($_.Count)" }
 }
 
-# ---- EMPTY ----
 Write-Host "`n---------- EMPTY RESPONSES (HTTP success, no data) ----------" -ForegroundColor Magenta
 if ($empty.Count -eq 0) { Write-Host "None" -ForegroundColor Green }
-else { Show $empty @('Row','BAID','SentEHC','OriginalEHC','HttpStatus') }
+else { ShowRows $empty @('Row','BAID','SentEHC','OriginalEHC','HttpStatus') }
 
-# ---- NO EHC ----
 Write-Host "`n---------- RECORDS WITH NO EHC (outcome of trying anyway) ----------" -ForegroundColor Yellow
-if ($noEhcAll.Count -eq 0) { Write-Host "None" -ForegroundColor Green }
-else { Show $noEhcAll @('Row','BAID','OriginalEHC','Category','HttpStatus','Error') }
+if ($noEhcAll.Count -eq 0) { Write-Host "None" }
+else { ShowRows $noEhcAll @('Row','BAID','OriginalEHC','Category','HttpStatus','Error') }
 
-# ---- WITHDRAWN ----
 Write-Host "`n---------- (Withdrawn) CLEANED ----------" -ForegroundColor Yellow
 if ($withdrawn.Count -eq 0) { Write-Host "None" }
-else { Show $withdrawn @('Row','BAID','OriginalEHC','SentEHC','Category','HttpStatus') }
+else { ShowRows $withdrawn @('Row','BAID','OriginalEHC','SentEHC','Category','HttpStatus') }
 
-# ---- RETRIED ----
 Write-Host "`n---------- SUCCEEDED AFTER RETRY ----------" -ForegroundColor DarkYellow
 if ($retried.Count -eq 0) { Write-Host "None" }
-else { Show $retried @('Row','BAID','SentEHC','Attempts','RetryHistory') }
+else { ShowRows $retried @('Row','BAID','SentEHC','Attempts','RetryHistory') }
 
-# ---- EHC MISMATCH (debug aid) ----
-$mismatch = @($results | Where-Object { $_.Category -like "PASSED*" -and $_.SentEHC -and $_.RespEHC -and $_.SentEHC -ne $_.RespEHC })
 Write-Host "`n---------- SENT EHC != EHC RETURNED BY API ----------" -ForegroundColor Yellow
 if ($mismatch.Count -eq 0) { Write-Host "None" }
-else { Show $mismatch @('Row','BAID','SentEHC','RespEHC','RespEHCStatus') }
+else { ShowRows $mismatch @('Row','BAID','SentEHC','RespEHC','RespEHCStatus') }
 
 Write-Host "`nDone. Full data is in memory in `$results (nothing written to disk)." -ForegroundColor Cyan
-Write-Host "Handy: `$results | ? Category -eq 'FAILED' | select Row,BAID,SentEHC,Error,ErrorBody | fl" -ForegroundColor DarkGray
