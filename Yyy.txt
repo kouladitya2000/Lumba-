@@ -1,24 +1,14 @@
-# Requires Az.Accounts and Az.Resources, and Connect-AzAccount first
+$subId    = 'a5807103-e3fc-4770-bb5e-4e56ec106b85'   # from the URL in your screenshot
+$newEhcId = '<NEW_VALUE>'                             # replace with the new EHC ID
 
-# Get Decommissioned MG with all nested children
-$mg = Get-AzManagementGroup -GroupName 'Decommissioned' -Expand -Recurse
+Set-AzContext -Subscription $subId | Out-Null
+$scope = "/subscriptions/$subId"
 
-# Walk the tree and collect every subscription ID under it
-function Get-MgSubscriptionIds($group) {
-    foreach ($child in $group.Children) {
-        if ($child.Type -eq '/subscriptions') {
-            $child.Name                      # Name = subscription ID
-        }
-        elseif ($child.Type -like '*managementGroups') {
-            Get-MgSubscriptionIds $child     # recurse into nested MGs
-        }
-    }
-}
+# Before
+(Get-AzTag -ResourceId $scope).Properties.TagsProperty
 
-$excludedIds = @(Get-MgSubscriptionIds $mg)
+# Merge: only touches the EHC ID key, all other tags stay as is
+Update-AzTag -ResourceId $scope -Tag @{ 'EHC ID' = $newEhcId } -Operation Merge
 
-# Enabled subscriptions, minus the Decommissioned ones
-$enabledSubs = Get-AzSubscription |
-    Where-Object { $_.State -eq 'Enabled' -and $_.Id -notin $excludedIds }
-
-"Enabled subscriptions (excluding Decommissioned): $($enabledSubs.Count)"
+# After
+(Get-AzTag -ResourceId $scope).Properties.TagsProperty
