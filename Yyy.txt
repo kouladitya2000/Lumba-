@@ -1,14 +1,27 @@
-$subId    = 'a5807103-e3fc-4770-bb5e-4e56ec106b85'   # from the URL in your screenshot
-$newEhcId = '<NEW_VALUE>'                             # replace with the new EHC ID
 
-Set-AzContext -Subscription $subId | Out-Null
-$scope = "/subscriptions/$subId"
+$StartDate = Get-Date "2026-03-01"
+$OutputFile = "$env:USERPROFILE\Desktop\File_Inventory.csv"
 
-# Before
-(Get-AzTag -ResourceId $scope).Properties.TagsProperty
+$Extensions = @("*.xlsx", "*.xls", "*.xlsm", "*.xlsb", "*.cab")
 
-# Merge: only touches the EHC ID key, all other tags stay as is
-Update-AzTag -ResourceId $scope -Tag @{ 'EHC ID' = $newEhcId } -Operation Merge
+$Results = foreach ($Drive in (Get-PSDrive -PSProvider FileSystem)) {
 
-# After
-(Get-AzTag -ResourceId $scope).Properties.TagsProperty
+    Get-ChildItem -Path $Drive.Root `
+        -Include $Extensions `
+        -File `
+        -Recurse `
+        -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.LastWriteTime -ge $StartDate
+    } |
+    Select-Object `
+        @{Name="File name"; Expression={$_.Name}},
+        @{Name="Date"; Expression={$_.LastWriteTime.ToString("dd-MMM-yyyy HH:mm")}},
+        @{Name="Path"; Expression={$_.DirectoryName}}
+}
+
+$Results |
+    Sort-Object Date -Descending |
+    Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+
+Write-Host "Completed! Report saved to $OutputFile"
