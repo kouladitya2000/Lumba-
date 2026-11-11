@@ -1,27 +1,20 @@
+# Sign in and select the subscription
+Connect-AzAccount
+$subName = "hsbc-multi-corecomp-nonprod-01"
+Set-AzContext -Subscription $subName
 
-$StartDate = Get-Date "2026-03-01"
-$OutputFile = "$env:USERPROFILE\Desktop\File_Inventory.csv"
+# Build the subscription resource ID
+$subId = (Get-AzContext).Subscription.Id
+$scope = "/subscriptions/$subId"
 
-$Extensions = @("*.xlsx", "*.xls", "*.xlsm", "*.xlsb", "*.cab")
-
-$Results = foreach ($Drive in (Get-PSDrive -PSProvider FileSystem)) {
-
-    Get-ChildItem -Path $Drive.Root `
-        -Include $Extensions `
-        -File `
-        -Recurse `
-        -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.LastWriteTime -ge $StartDate
-    } |
-    Select-Object `
-        @{Name="File name"; Expression={$_.Name}},
-        @{Name="Date"; Expression={$_.LastWriteTime.ToString("dd-MMM-yyyy HH:mm")}},
-        @{Name="Path"; Expression={$_.DirectoryName}}
+# New values (replace with yours)
+$newTags = @{
+    "BA ID"  = "BA0009949"
+    "EHC ID" = "RITM32949150"
 }
 
-$Results |
-    Sort-Object Date -Descending |
-    Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+# Merge: updates only these two tags, keeps all others
+Update-AzTag -ResourceId $scope -Tag $newTags -Operation Merge
 
-Write-Host "Completed! Report saved to $OutputFile"
+# Verify
+(Get-AzTag -ResourceId $scope).Properties.TagsProperty
