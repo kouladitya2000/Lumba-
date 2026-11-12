@@ -1,20 +1,12 @@
-# Sign in and select the subscription
-Connect-AzAccount
-$subName = "hsbc-multi-corecomp-nonprod-01"
-Set-AzContext -Subscription $subName
-
-# Build the subscription resource ID
-$subId = (Get-AzContext).Subscription.Id
-$scope = "/subscriptions/$subId"
-
-# New values (replace with yours)
-$newTags = @{
-    "BA ID"  = "BA0009949"
-    "EHC ID" = "RITM32949150"
-}
-
-# Merge: updates only these two tags, keeps all others
-Update-AzTag -ResourceId $scope -Tag $newTags -Operation Merge
-
-# Verify
-(Get-AzTag -ResourceId $scope).Properties.TagsProperty
+Write-Output "--- fDenyTSConnections (0 = RDP enabled, 1 = disabled) ---"
+(Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server').fDenyTSConnections
+Write-Output "--- TermService ---"
+Get-Service TermService | Format-List Name,Status,StartType
+Write-Output "--- Listening on 3389 ---"
+netstat -an | findstr ":3389"
+Write-Output "--- Configured RDP port ---"
+(Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp').PortNumber
+Write-Output "--- RDP firewall rules ---"
+Get-NetFirewallRule -DisplayGroup "Remote Desktop" | Select DisplayName,Enabled,Direction,Action | Format-Table -AutoSize
+Write-Output "--- Firewall profiles ---"
+Get-NetFirewallProfile | Select Name,Enabled | Format-Table -AutoSize
