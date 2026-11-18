@@ -1,12 +1,4 @@
-Write-Output "--- fDenyTSConnections (0 = RDP enabled, 1 = disabled) ---"
-(Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server').fDenyTSConnections
-Write-Output "--- TermService ---"
-Get-Service TermService | Format-List Name,Status,StartType
-Write-Output "--- Listening on 3389 ---"
-netstat -an | findstr ":3389"
-Write-Output "--- Configured RDP port ---"
-(Get-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp').PortNumber
-Write-Output "--- RDP firewall rules ---"
-Get-NetFirewallRule -DisplayGroup "Remote Desktop" | Select DisplayName,Enabled,Direction,Action | Format-Table -AutoSize
-Write-Output "--- Firewall profiles ---"
-Get-NetFirewallProfile | Select Name,Enabled | Format-Table -AutoSize
+Set-AzEventHubNamespace `
+  -ResourceGroupName "rg-cstmg-dev-eun-squid-access-log-format-splunk" `
+  -Name "ehn-cstmg-dev-eun-squid-access-log-format-splunk" `
+  -DisableLocalAuth
