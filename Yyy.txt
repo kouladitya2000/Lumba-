@@ -1,4 +1,3 @@
-Set-AzEventHubNamespace `
-  -ResourceGroupName "rg-cstmg-dev-eun-squid-access-log-format-splunk" `
-  -Name "ehn-cstmg-dev-eun-squid-access-log-format-splunk" `
-  -DisableLocalAuth
+Invoke-AzRestMethod -Method PATCH `
+  -Path "/subscriptions/8e9330c1-d93a-4d8f-bf70-79ac12193772/resourceGroups/rg-cstmg-dev-eun-squid-access-log-format-splunk/providers/Microsoft.EventHub/namespaces/ehn-cstmg-dev-eun-squid-access-log-format-splunk?api-version=2024-01-01" `
+  -Payload '{"properties":{"disableLocalAuth":true}}'
